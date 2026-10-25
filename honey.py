@@ -12,6 +12,15 @@ HONEY_MIN = 30
 HONEY_MAX = 40
 HONEY_DURATION_MINUTES = 60
 
+# Единое время MurrlyBot для расписания раздач.
+# Не зависит от системного времени Bothost.
+BOT_TIME_OFFSET_HOURS = 3
+
+
+def bot_now():
+    return datetime.utcnow() + timedelta(hours=BOT_TIME_OFFSET_HOURS)
+
+
 _demo_lock = asyncio.Lock()
 
 
@@ -77,6 +86,50 @@ def init_honey_db():
         if "expires_at" not in columns:
             con.execute("ALTER TABLE honey_giveaways ADD COLUMN expires_at TEXT")
 
+        # Старые версии использовали системные часы Bothost (UTC).
+        # Один раз сдвигаем уже существующие активные раздачи на +3 часа,
+        # чтобы текущая тестовая раздача тоже получила правильное время.
+        clock_migration = con.execute("""
+            SELECT value FROM bot_settings
+            WHERE key='honey_clock_utc3_migrated'
+        """).fetchone()
+
+        if not clock_migration:
+            active_rows = con.execute("""
+                SELECT id, created_at, expires_at
+                FROM honey_giveaways
+                WHERE active=1
+            """).fetchall()
+
+            for row in active_rows:
+                try:
+                    created = datetime.fromisoformat(row["created_at"])
+                    created = created + timedelta(hours=BOT_TIME_OFFSET_HOURS)
+                    expires = (
+                        datetime.fromisoformat(row["expires_at"])
+                        if row["expires_at"]
+                        else created + timedelta(minutes=HONEY_DURATION_MINUTES)
+                    )
+                    if row["expires_at"]:
+                        expires = expires + timedelta(hours=BOT_TIME_OFFSET_HOURS)
+
+                    con.execute("""
+                        UPDATE honey_giveaways
+                        SET created_at=?, expires_at=?
+                        WHERE id=?
+                    """, (
+                        created.isoformat(timespec="seconds"),
+                        expires.isoformat(timespec="seconds"),
+                        row["id"],
+                    ))
+                except Exception as exc:
+                    print(f"Honey clock migration failed for giveaway {row['id']}: {exc}")
+
+            con.execute("""
+                INSERT INTO bot_settings(key, value)
+                VALUES ('honey_clock_utc3_migrated', '1')
+            """)
+
         # Для уже созданных раздач выставляем закрытие через час от created_at.
         old_rows = con.execute("""
             SELECT id, created_at
@@ -87,7 +140,7 @@ def init_honey_db():
             try:
                 created = datetime.fromisoformat(row["created_at"])
             except Exception:
-                created = datetime.now()
+                created = bot_now()
             expires = created + timedelta(minutes=HONEY_DURATION_MINUTES)
             con.execute(
                 "UPDATE honey_giveaways SET expires_at=? WHERE id=?",
@@ -97,7 +150,7 @@ def init_honey_db():
         # У старой версии не было отдельной таблицы чатов.
         # Берём уже знакомые чаты из существующей RP-статистики,
         # чтобы одноразовая демо-раздача могла появиться сразу после обновления.
-        now = datetime.now().isoformat(timespec="seconds")
+        now = bot_now().isoformat(timespec="seconds")
         con.execute("""
             INSERT OR IGNORE INTO chats(chat_id, chat_type, title, last_seen)
             SELECT DISTINCT chat_id, 'group', '', ? FROM pair_stats
@@ -123,7 +176,7 @@ def register_chat(chat_id: int, chat_type: str, title: str | None = None):
             chat_id,
             chat_type,
             title or "",
-            datetime.now().isoformat(timespec="seconds"),
+            bot_now().isoformat(timespec="seconds"),
         ))
 
 
@@ -179,7 +232,7 @@ def _random_time(start_hour: int, end_hour: int) -> str:
 
 def ensure_today_schedule(day: str | None = None):
     if day is None:
-        day = datetime.now().date().isoformat()
+        day = bot_now().date().isoformat()
 
     with connect() as con:
         row = con.execute(
@@ -250,7 +303,7 @@ def expired_text(remaining: int, participants: int):
 def create_giveaway(chat_id: int, kind: str, schedule_day: str, schedule_slot: str):
     try:
         with connect() as con:
-            created_at = datetime.now()
+            created_at = bot_now()
             expires_at = created_at + timedelta(minutes=HONEY_DURATION_MINUTES)
             cur = con.execute("""
                 INSERT INTO honey_giveaways(
@@ -320,7 +373,7 @@ def claim_honey(giveaway_id: int, user_id: int):
             except Exception:
                 expires_at = None
 
-            if expires_at is not None and datetime.now() >= expires_at:
+            if expires_at is not None and bot_now() >= expires_at:
                 con.execute(
                     "UPDATE honey_giveaways SET active=0 WHERE id=?",
                     (giveaway_id,),
@@ -345,7 +398,7 @@ def claim_honey(giveaway_id: int, user_id: int):
         new_remaining = remaining - amount
         new_active = 1 if new_remaining > 0 else 0
         new_participants = int(giveaway["participants"]) + 1
-        now = datetime.now().isoformat(timespec="seconds")
+        now = bot_now().isoformat(timespec="seconds")
 
         con.execute("""
             INSERT INTO honey_claims(giveaway_id, user_id, amount, claimed_at)
@@ -457,7 +510,7 @@ async def maybe_launch_demo_once(bot, preferred_chat_id: int | None = None):
 
 async def refresh_active_giveaway_messages(bot):
     """После обновления добавляет время закрытия в уже активные раздачи."""
-    now = datetime.now()
+    now = bot_now()
     with connect() as con:
         rows = con.execute("""
             SELECT id, chat_id, remaining, kind, message_id, expires_at
@@ -490,7 +543,7 @@ async def refresh_active_giveaway_messages(bot):
 
 
 def get_expired_active_giveaways():
-    now = datetime.now()
+    now = bot_now()
     with connect() as con:
         rows = con.execute("""
             SELECT id, chat_id, remaining, participants, message_id, expires_at
@@ -569,7 +622,7 @@ async def honey_scheduler(bot):
 
     while True:
         try:
-            now = datetime.now()
+            now = bot_now()
             current_day = now.date().isoformat()
             current_minute = now.strftime("%H:%M")
 
