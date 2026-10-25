@@ -482,6 +482,74 @@ def apply_rp_health(user_a: int, user_b: int, action_key: str):
         con.close()
 
 
+def apply_bonus_health(user_a: int, user_b: int, requested_gain: float):
+    """Добавляет здоровье брака от подарков, используя тот же дневной лимит 3%."""
+    if requested_gain <= 0:
+        return None
+
+    marriage = get_marriage_between(user_a, user_b)
+    if not marriage:
+        return None
+
+    marriage_id = int(marriage["id"])
+    today = utc_now().date().isoformat()
+
+    con = connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+
+        row = con.execute(
+            "SELECT gained FROM marriage_daily_health WHERE marriage_id=? AND day=?",
+            (marriage_id, today),
+        ).fetchone()
+        gained_today = float(row["gained"]) if row else 0.0
+
+        available = max(0.0, DAILY_HEALTH_GAIN_LIMIT - gained_today)
+        actual_gain = min(float(requested_gain), available)
+
+        current = con.execute(
+            "SELECT health, active FROM marriages WHERE id=?",
+            (marriage_id,),
+        ).fetchone()
+        if not current or not current["active"]:
+            con.rollback()
+            return None
+
+        old_health = float(current["health"])
+        actual_gain = min(actual_gain, max(0.0, 100.0 - old_health))
+        new_health = min(100.0, old_health + actual_gain)
+
+        if actual_gain > 0:
+            con.execute(
+                "UPDATE marriages SET health=? WHERE id=?",
+                (new_health, marriage_id),
+            )
+            con.execute(
+                """
+                INSERT INTO marriage_daily_health(marriage_id, day, gained)
+                VALUES (?, ?, ?)
+                ON CONFLICT(marriage_id, day) DO UPDATE SET
+                    gained = gained + excluded.gained
+                """,
+                (marriage_id, today, actual_gain),
+            )
+
+        con.commit()
+        return {
+            "marriage_id": marriage_id,
+            "gain": actual_gain,
+            "old_health": old_health,
+            "new_health": new_health,
+            "daily_gained": gained_today + actual_gain,
+            "daily_limit": DAILY_HEALTH_GAIN_LIMIT,
+        }
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
 def divorce_marriage(marriage_id: int, requester_id: int):
     with connect() as con:
         row = con.execute(

@@ -37,6 +37,20 @@ from honey import (
     honey_expiration_scheduler,
     refresh_active_giveaway_messages,
 )
+from farm import (
+    init_farm_db,
+    get_farm,
+    collect_farm,
+    upgrade_farm,
+    farm_keyboard,
+)
+from gifts import (
+    init_gifts_db,
+    GIFT_CATALOG,
+    shop_keyboard,
+    purchase_gift,
+    get_gift_collection,
+)
 from marriage import (
     init_marriage_db,
     proposal_keyboard,
@@ -50,6 +64,7 @@ from marriage import (
     marriage_state,
     format_marriage_age,
     apply_rp_health,
+    apply_bonus_health,
     divorce_marriage,
     marriage_decay_scheduler,
 )
@@ -116,6 +131,61 @@ def action_list_text() -> str:
     return "\n".join(rows)
 
 
+def farm_card_text(user_link: str, farm: dict) -> str:
+    stored = int(float(farm["stored"]))
+    level = int(farm["level"])
+
+    lines = [
+        f"🐝 <b>Медовая ферма {user_link}</b>",
+        "",
+        f"Уровень: <b>{level}</b>",
+        f"🍯 Производство: <b>{farm['production']} мёдика в сутки</b>",
+        f"📦 В сотах: <b>{stored} / {farm['capacity']} 🍯</b>",
+    ]
+
+    if stored >= int(farm["capacity"]):
+        lines.append("⚠️ <b>Соты заполнены — производство остановлено.</b>")
+
+    if farm["upgrade_cost"] is None:
+        lines.extend(["", "👑 <b>Максимальный уровень фермы.</b>"])
+    else:
+        next_level = level + 1
+        lines.extend([
+            "",
+            f"⬆️ Следующий уровень: <b>{next_level}</b>",
+            f"💰 Улучшение: <b>{farm['upgrade_cost']} 🍯</b>",
+        ])
+
+    return "\n".join(lines)
+
+
+def gift_shop_text(recipient_link: str, balance: int) -> str:
+    return (
+        "🎁 <b>Магазин подарков</b>\n\n"
+        f"Подарок для: {recipient_link}\n"
+        f"Твой баланс: <b>{balance} 🍯</b>\n\n"
+        "Выбери подарок:"
+    )
+
+
+def gift_collection_text(user_link: str, collection: dict) -> str:
+    if not collection["items"]:
+        return (
+            f"🎁 <b>Подарки {user_link}</b>\n\n"
+            "Пока подарков нет."
+        )
+
+    rows = [
+        f"{item['emoji']} {item['name']} ×<b>{item['count']}</b>"
+        for item in collection["items"]
+    ]
+    return (
+        f"🎁 <b>Подарки {user_link}</b>\n\n"
+        + "\n".join(rows)
+        + f"\n\nВсего получено: <b>{collection['total']}</b>"
+    )
+
+
 async def remember_group_chat(message: Message):
     if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         chat_type = (
@@ -151,7 +221,10 @@ async def cmd_start(message: Message):
         "💍 <code>заключить брак</code> — ответом на сообщение\n"
         "❤️ <code>брак</code> — состояние твоего брака\n"
         "💔 <code>развестись</code> — расторгнуть брак\n"
-        "🍯 <code>копилка</code> — твой запас мёдика"
+        "🍯 <code>копилка</code> — твой запас мёдика\n"
+        "🐝 <code>ферма</code> — медовая ферма\n"
+        "🎁 <code>магазин</code> — ответом на сообщение получателя\n"
+        "🎀 <code>подарки</code> — коллекция подарков"
     )
 
 
@@ -238,6 +311,162 @@ async def honey_claim_handler(callback: CallbackQuery):
                 )
         except Exception as exc:
             print(f"Honey message edit failed: {exc}")
+
+
+
+@dp.callback_query(F.data.startswith("farm:"))
+async def farm_callback_handler(callback: CallbackQuery):
+    if not callback.from_user or not callback.data:
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректное действие.", show_alert=True)
+        return
+
+    action = parts[1]
+    try:
+        owner_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Некорректная ферма.", show_alert=True)
+        return
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("🐝 Это не твоя ферма.", show_alert=True)
+        return
+
+    if action == "collect":
+        result = collect_farm(owner_id)
+
+        if result["status"] == "empty":
+            await callback.answer(
+                "🍯 В сотах пока меньше 1 мёдика.",
+                show_alert=True,
+            )
+        else:
+            await callback.answer(f"+{result['amount']} 🍯 в копилку!")
+            if callback.message:
+                await callback.message.answer(
+                    f"🍯 {mention(callback.from_user)} собрал "
+                    f"<b>{result['amount']} мёдика</b> с фермы.\n"
+                    f"В копилке: <b>{result['balance']} 🍯</b>"
+                )
+
+        farm = result["farm"]
+        if callback.message:
+            await callback.message.edit_text(
+                farm_card_text(mention(callback.from_user), farm),
+                reply_markup=farm_keyboard(owner_id, farm),
+            )
+        return
+
+    if action == "upgrade":
+        result = upgrade_farm(owner_id)
+
+        if result["status"] == "max":
+            await callback.answer("👑 Ферма уже максимального уровня.", show_alert=True)
+        elif result["status"] == "insufficient":
+            await callback.answer(
+                f"Не хватает {result['need']} 🍯.",
+                show_alert=True,
+            )
+        else:
+            await callback.answer(
+                f"🐝 Ферма улучшена до {result['farm']['level']} уровня!"
+            )
+            if callback.message:
+                await callback.message.answer(
+                    f"⬆️ {mention(callback.from_user)} улучшил медовую ферму "
+                    f"до <b>{result['farm']['level']} уровня</b> за "
+                    f"<b>{result['cost']} 🍯</b>."
+                )
+
+        farm = result["farm"]
+        if callback.message:
+            await callback.message.edit_text(
+                farm_card_text(mention(callback.from_user), farm),
+                reply_markup=farm_keyboard(owner_id, farm),
+            )
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("gift:"))
+async def gift_callback_handler(callback: CallbackQuery):
+    if not callback.from_user or not callback.data:
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 5 or parts[1] != "buy":
+        await callback.answer("Некорректный подарок.", show_alert=True)
+        return
+
+    gift_key = parts[2]
+    try:
+        recipient_id = int(parts[3])
+        giver_id = int(parts[4])
+    except ValueError:
+        await callback.answer("Некорректный подарок.", show_alert=True)
+        return
+
+    if callback.from_user.id != giver_id:
+        await callback.answer("🐝 Этот магазин открыт не тобой.", show_alert=True)
+        return
+
+    result = purchase_gift(giver_id, recipient_id, gift_key)
+
+    if result["status"] == "insufficient":
+        await callback.answer(
+            f"Не хватает {result['need']} 🍯.",
+            show_alert=True,
+        )
+        return
+    if result["status"] != "ok":
+        await callback.answer("Не удалось купить подарок.", show_alert=True)
+        return
+
+    gift = result["gift"]
+    recipient = get_user(recipient_id)
+    recipient_link = mention_by_id(
+        recipient_id,
+        recipient["name"] if recipient else None,
+    )
+
+    marriage_health = apply_bonus_health(
+        giver_id,
+        recipient_id,
+        float(gift["health_bonus"]),
+    )
+
+    await callback.answer(f"{gift['emoji']} Подарок отправлен!")
+
+    if callback.message:
+        result_text = (
+            f"🎁 {mention(callback.from_user)} подарил {recipient_link} "
+            f"<b>{gift['name']}</b> {gift['emoji']}\n\n"
+            f"Стоимость: <b>{gift['price']} 🍯</b>\n"
+            f"У дарителя осталось: <b>{result['balance']} 🍯</b>\n"
+            f"У получателя теперь: <b>{result['recipient_count']}</b> шт."
+        )
+
+        if marriage_health and marriage_health["gain"] > 0:
+            gain = marriage_health["gain"]
+            gain_text = f"{gain:.1f}".rstrip("0").rstrip(".")
+            current = int(round(marriage_health["new_health"]))
+            result_text += (
+                f"\n❤️ Здоровье брака: <b>+{gain_text}%</b> · "
+                f"Сейчас: <b>{current}%</b>"
+            )
+
+        await callback.message.answer(result_text)
+
+        # Магазин остаётся открытым — можно подарить ещё что-нибудь.
+        await callback.message.edit_text(
+            gift_shop_text(recipient_link, result["balance"]),
+            reply_markup=shop_keyboard(giver_id, recipient_id),
+        )
+    return
 
 
 @dp.callback_query(F.data.startswith("marriage:"))
@@ -417,6 +646,55 @@ async def text_handler(message: Message):
             f"Всего собрано: <b>{wallet['total_earned']} 🍯</b>\n"
             f"Раздач поймано: <b>{wallet['giveaways_claimed']}</b>\n"
             f"Самый большой улов: <b>{wallet['biggest_claim']} 🍯</b>"
+        )
+        return
+
+    # Медовая ферма
+    if text in {"ферма", "моя ферма", "медовая ферма"}:
+        farm = get_farm(message.from_user.id)
+        await message.answer(
+            farm_card_text(mention(message.from_user), farm),
+            reply_markup=farm_keyboard(message.from_user.id, farm),
+        )
+        return
+
+    # Магазин подарков — открывается ответом на сообщение получателя.
+    if text in {"магазин", "магазин подарков", "подарить подарок"}:
+        if not message.reply_to_message or not message.reply_to_message.from_user:
+            await message.reply(
+                "🎁 Отправь <code>магазин</code> ответом на сообщение человека, "
+                "которому хочешь сделать подарок."
+            )
+            return
+
+        target = message.reply_to_message.from_user
+        if target.id == message.from_user.id:
+            await message.reply("🎁 Подарки из магазина предназначены другим участникам.")
+            return
+        if target.is_bot:
+            await message.reply("🐝 Ботам подарки пока дарить нельзя.")
+            return
+
+        upsert_user(target.id, target.full_name)
+        wallet = get_wallet(message.from_user.id)
+
+        await message.answer(
+            gift_shop_text(mention(target), wallet["balance"]),
+            reply_markup=shop_keyboard(message.from_user.id, target.id),
+        )
+        return
+
+    # Коллекция подарков. Ответом на сообщение можно посмотреть чужую.
+    if text in {"подарки", "мои подарки", "коллекция подарков"}:
+        target = (
+            message.reply_to_message.from_user
+            if message.reply_to_message and message.reply_to_message.from_user
+            else message.from_user
+        )
+
+        collection = get_gift_collection(target.id)
+        await message.answer(
+            gift_collection_text(mention(target), collection)
         )
         return
 
@@ -677,6 +955,8 @@ async def main():
     init_db()
     init_honey_db()
     init_marriage_db()
+    init_farm_db()
+    init_gifts_db()
 
     # Демонстрационная раздача запускается только один раз после обновления.
     asyncio.create_task(maybe_launch_demo_once(bot))
@@ -695,7 +975,7 @@ async def main():
     # Раз в час пересчитываем очень медленный естественный спад здоровья браков.
     asyncio.create_task(marriage_decay_scheduler())
 
-    print("MurrlyBot marriage update starting...")
+    print("MurrlyBot farm + gifts update starting...")
     await dp.start_polling(bot)
 
 
