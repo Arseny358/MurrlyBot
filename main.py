@@ -6,9 +6,9 @@ import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatType
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 
 from rp_actions import ACTIONS, ALIASES
 from database import (
@@ -20,6 +20,18 @@ from database import (
     get_user_action_count,
     top_pairs,
     top_actions_between,
+)
+from honey import (
+    init_honey_db,
+    register_chat,
+    get_wallet,
+    get_giveaway,
+    claim_honey,
+    honey_keyboard,
+    giveaway_text,
+    finished_text,
+    maybe_launch_demo_once,
+    honey_scheduler,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -84,9 +96,27 @@ def action_list_text() -> str:
     return "\n".join(rows)
 
 
+async def remember_group_chat(message: Message):
+    if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        chat_type = (
+            message.chat.type.value
+            if hasattr(message.chat.type, "value")
+            else str(message.chat.type)
+        )
+        register_chat(
+            message.chat.id,
+            chat_type,
+            message.chat.title or "",
+        )
+        # Если после обновления бот ещё не успел найти знакомый чат,
+        # первая новая активность в группе запустит одноразовую демо-раздачу.
+        await maybe_launch_demo_once(bot, message.chat.id)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     upsert_user(message.from_user.id, message.from_user.full_name)
+    await remember_group_chat(message)
     await message.answer(
         "🐝 <b>MurrlyBot работает!</b>\n\n"
         "Это RP-бот для групповых чатов.\n"
@@ -97,13 +127,64 @@ async def cmd_start(message: Message):
         "📖 <code>рп команды</code> — все действия\n"
         "💕 <code>отношения</code> — ответом на сообщение человека\n"
         "👤 <code>рп профиль</code> — твоя статистика\n"
-        "🏆 <code>рп топ</code> — пары чата"
+        "🏆 <code>рп топ</code> — пары чата\n"
+        "🍯 <code>копилка</code> — твой запас мёдика"
     )
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await cmd_start(message)
+
+
+@dp.callback_query(F.data.startswith("honey:"))
+async def honey_claim_handler(callback: CallbackQuery):
+    if not callback.from_user or not callback.data:
+        return
+
+    try:
+        giveaway_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная раздача.", show_alert=True)
+        return
+
+    upsert_user(callback.from_user.id, callback.from_user.full_name)
+    result = claim_honey(giveaway_id, callback.from_user.id)
+
+    if result["status"] == "already":
+        await callback.answer(
+            "Ты уже забрал мёдик из этой раздачи 🐝",
+            show_alert=True,
+        )
+        return
+
+    if result["status"] == "ended":
+        await callback.answer("Мёдик уже разобрали 🍯", show_alert=True)
+        return
+
+    await callback.answer(f"+{result['amount']} 🍯 в твою копилку!")
+
+    if callback.message:
+        user_link = mention(callback.from_user)
+        await callback.message.answer(
+            f"🍯 {user_link} забрал <b>{result['amount']} мёдика!</b>\n\n"
+            f"В копилке: <b>{result['balance']} 🍯</b>\n"
+            f"В улье осталось: <b>{result['remaining']} 🍯</b>"
+        )
+
+        try:
+            if result["active"]:
+                await callback.message.edit_text(
+                    giveaway_text(result["remaining"], demo=False),
+                    reply_markup=honey_keyboard(giveaway_id),
+                )
+            else:
+                await callback.message.edit_text(
+                    finished_text(result["participants"]),
+                    reply_markup=None,
+                )
+        except Exception as exc:
+            print(f"Honey message edit failed: {exc}")
 
 
 @dp.message(F.text)
@@ -125,6 +206,19 @@ async def text_handler(message: Message):
         return
 
     upsert_user(message.from_user.id, message.from_user.full_name)
+    await remember_group_chat(message)
+
+    # Копилка мёдика
+    if text in {"копилка", "мой медик", "мой мёдик", "медик", "мёдик"}:
+        wallet = get_wallet(message.from_user.id)
+        await message.answer(
+            f"🍯 <b>Копилка {mention(message.from_user)}</b>\n\n"
+            f"Баланс: <b>{wallet['balance']} 🍯</b>\n"
+            f"Всего собрано: <b>{wallet['total_earned']} 🍯</b>\n"
+            f"Раздач поймано: <b>{wallet['giveaways_claimed']}</b>\n"
+            f"Самый большой улов: <b>{wallet['biggest_claim']} 🍯</b>"
+        )
+        return
 
     # Список команд
     if text in {"рп", "рп команды", "rp", "rp команды", "рп помощь"}:
@@ -279,7 +373,16 @@ async def text_handler(message: Message):
 
 async def main():
     init_db()
-    print("MurrlyBot v2 starting...")
+    init_honey_db()
+
+    # Демонстрационная раздача запускается только один раз после обновления.
+    asyncio.create_task(maybe_launch_demo_once(bot))
+
+    # Дальше бот работает штатно: одна случайная раздача 09:00–15:00
+    # и одна случайная раздача 16:00–23:00 каждый день.
+    asyncio.create_task(honey_scheduler(bot))
+
+    print("MurrlyBot honey update starting...")
     await dp.start_polling(bot)
 
 
