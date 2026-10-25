@@ -53,6 +53,16 @@ from gifts import (
     transfer_gift,
     get_gift_collection,
 )
+from mass_event import (
+    init_mass_event_db,
+    get_event as get_mass_event,
+    join_event as join_mass_event,
+    event_keyboard as mass_event_keyboard,
+    event_text as mass_event_text,
+    finished_event_text as mass_event_finished_text,
+    mass_event_scheduler,
+    mass_event_expiration_scheduler,
+)
 from marriage import (
     init_marriage_db,
     proposal_keyboard,
@@ -219,7 +229,7 @@ async def remember_group_chat(message: Message):
             message.chat.title or "",
         )
         # Если после обновления бот ещё не успел найти знакомый чат,
-        # первая новая активность в группе запустит одноразовую демо-раздачу.
+        # первая новая активность в группе запустит одноразовые демонстрации.
         await maybe_launch_demo_once(bot, message.chat.id)
 
 
@@ -252,6 +262,73 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await cmd_start(message)
+
+
+@dp.callback_query(F.data.startswith("massorgy:"))
+async def mass_orgy_callback_handler(callback: CallbackQuery):
+    if not callback.from_user or not callback.data:
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[1] != "join":
+        await callback.answer("Некорректное событие.", show_alert=True)
+        return
+
+    try:
+        event_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Некорректное событие.", show_alert=True)
+        return
+
+    upsert_user(callback.from_user.id, callback.from_user.full_name)
+    result = join_mass_event(event_id, callback.from_user.id)
+
+    if result["status"] == "already":
+        await callback.answer(
+            "🔥 Ты уже участвуешь в этом событии.",
+            show_alert=True,
+        )
+        return
+
+    if result["status"] == "ended":
+        await callback.answer(
+            "⏰ Событие уже завершено.",
+            show_alert=True,
+        )
+
+        event = get_mass_event(event_id)
+        if callback.message and event:
+            try:
+                await callback.message.edit_text(
+                    mass_event_finished_text(event["participants"]),
+                    reply_markup=None,
+                )
+            except Exception as exc:
+                print(f"Mass orgy expired edit failed: {exc}")
+        return
+
+    await callback.answer("🔥 Ты присоединился к событию!")
+
+    event = get_mass_event(event_id)
+    if callback.message and event:
+        closes_at = None
+        try:
+            closes_at = datetime.fromisoformat(
+                event["expires_at"]
+            ).strftime("%H:%M")
+        except Exception:
+            pass
+
+        try:
+            await callback.message.edit_text(
+                mass_event_text(
+                    participants=result["participants"],
+                    closes_at=closes_at,
+                ),
+                reply_markup=mass_event_keyboard(event_id),
+            )
+        except Exception as exc:
+            print(f"Mass orgy participant edit failed: {exc}")
 
 
 @dp.callback_query(F.data.startswith("honey:"))
@@ -1057,6 +1134,7 @@ async def main():
     init_marriage_db()
     init_farm_db()
     init_gifts_db()
+    init_mass_event_db()
 
     # Демонстрационная раздача запускается только один раз после обновления.
     asyncio.create_task(maybe_launch_demo_once(bot))
@@ -1075,7 +1153,13 @@ async def main():
     # Раз в час пересчитываем очень медленный естественный спад здоровья браков.
     asyncio.create_task(marriage_decay_scheduler())
 
-    print("MurrlyBot farm + gifts update starting...")
+    # RP-событие запускается только штатно: каждый день в 23:00.
+    asyncio.create_task(mass_event_scheduler(bot))
+
+    # Событие закрывается через час после запуска.
+    asyncio.create_task(mass_event_expiration_scheduler(bot))
+
+    print("MurrlyBot mass RP event update starting...")
     await dp.start_polling(bot)
 
 
