@@ -37,6 +37,22 @@ from honey import (
     honey_expiration_scheduler,
     refresh_active_giveaway_messages,
 )
+from marriage import (
+    init_marriage_db,
+    proposal_keyboard,
+    divorce_keyboard,
+    create_proposal,
+    get_proposal,
+    accept_proposal,
+    reject_proposal,
+    get_active_marriage,
+    get_marriage_by_id,
+    marriage_state,
+    format_marriage_age,
+    apply_rp_health,
+    divorce_marriage,
+    marriage_decay_scheduler,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -132,6 +148,9 @@ async def cmd_start(message: Message):
         "💕 <code>отношения</code> — ответом на сообщение человека\n"
         "👤 <code>рп профиль</code> — твоя статистика\n"
         "🏆 <code>рп топ</code> — пары чата\n"
+        "💍 <code>заключить брак</code> — ответом на сообщение\n"
+        "❤️ <code>брак</code> — состояние твоего брака\n"
+        "💔 <code>развестись</code> — расторгнуть брак\n"
         "🍯 <code>копилка</code> — твой запас мёдика"
     )
 
@@ -221,6 +240,153 @@ async def honey_claim_handler(callback: CallbackQuery):
             print(f"Honey message edit failed: {exc}")
 
 
+@dp.callback_query(F.data.startswith("marriage:"))
+async def marriage_callback_handler(callback: CallbackQuery):
+    if not callback.from_user or not callback.data:
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Некорректное действие.", show_alert=True)
+        return
+
+    action = parts[1]
+
+    if action in {"accept", "reject"}:
+        try:
+            proposal_id = int(parts[2])
+        except ValueError:
+            await callback.answer("Некорректное предложение.", show_alert=True)
+            return
+
+        proposal = get_proposal(proposal_id)
+        if not proposal:
+            await callback.answer("Предложение не найдено.", show_alert=True)
+            return
+
+        if callback.from_user.id != proposal["target_id"]:
+            await callback.answer(
+                "🐝 Это предложение предназначено не тебе.",
+                show_alert=True,
+            )
+            return
+
+        proposer = get_user(proposal["proposer_id"])
+        target = get_user(proposal["target_id"])
+        proposer_link = mention_by_id(
+            proposal["proposer_id"],
+            proposer["name"] if proposer else None,
+        )
+        target_link = mention_by_id(
+            proposal["target_id"],
+            target["name"] if target else callback.from_user.full_name,
+        )
+
+        if action == "reject":
+            result = reject_proposal(proposal_id, callback.from_user.id)
+            if result["status"] == "closed":
+                await callback.answer("Это предложение уже закрыто.", show_alert=True)
+                return
+            if result["status"] != "ok":
+                await callback.answer("Не удалось обработать предложение.", show_alert=True)
+                return
+
+            await callback.answer("Предложение отклонено.")
+            if callback.message:
+                await callback.message.edit_text(
+                    f"💔 {target_link} отказался от предложения {proposer_link}.",
+                    reply_markup=None,
+                )
+            return
+
+        result = accept_proposal(proposal_id, callback.from_user.id)
+        if result["status"] == "closed":
+            await callback.answer("Это предложение уже закрыто.", show_alert=True)
+            return
+        if result["status"] == "someone_married":
+            await callback.answer(
+                "Один из участников уже состоит в браке.",
+                show_alert=True,
+            )
+            if callback.message:
+                await callback.message.edit_text(
+                    "💔 Предложение больше неактуально: один из участников уже состоит в браке.",
+                    reply_markup=None,
+                )
+            return
+        if result["status"] != "ok":
+            await callback.answer("Не удалось заключить брак.", show_alert=True)
+            return
+
+        await callback.answer("💍 Брак заключён!")
+        if callback.message:
+            await callback.message.edit_text(
+                "💖 <b>БРАК ЗАКЛЮЧЁН!</b>\n\n"
+                f"{proposer_link} ❤️ {target_link}\n\n"
+                "❤️ Здоровье брака: <b>100%</b>\n"
+                "🕒 Вместе: <b>только что</b>",
+                reply_markup=None,
+            )
+        return
+
+    if action in {"divorce", "cancel_divorce"}:
+        if len(parts) < 4:
+            await callback.answer("Некорректное действие.", show_alert=True)
+            return
+        try:
+            marriage_id = int(parts[2])
+            requester_id = int(parts[3])
+        except ValueError:
+            await callback.answer("Некорректное действие.", show_alert=True)
+            return
+
+        if callback.from_user.id != requester_id:
+            await callback.answer(
+                "🐝 Это подтверждение предназначено не тебе.",
+                show_alert=True,
+            )
+            return
+
+        marriage = get_marriage_by_id(marriage_id)
+        if not marriage or not marriage["active"]:
+            await callback.answer("Этот брак уже завершён.", show_alert=True)
+            if callback.message:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            return
+
+        if requester_id not in {marriage["user1_id"], marriage["user2_id"]}:
+            await callback.answer("Ты не состоишь в этом браке.", show_alert=True)
+            return
+
+        user1 = mention_by_id(marriage["user1_id"], marriage["user1_name"])
+        user2 = mention_by_id(marriage["user2_id"], marriage["user2_name"])
+
+        if action == "cancel_divorce":
+            await callback.answer("Развод отменён.")
+            if callback.message:
+                await callback.message.edit_text(
+                    f"💍 Развод отменён.\n\n{user1} ❤️ {user2}",
+                    reply_markup=None,
+                )
+            return
+
+        result = divorce_marriage(marriage_id, requester_id)
+        if result["status"] != "ok":
+            await callback.answer("Не удалось расторгнуть брак.", show_alert=True)
+            return
+
+        await callback.answer("Брак расторгнут.")
+        if callback.message:
+            await callback.message.edit_text(
+                "💔 <b>БРАК РАСТОРГНУТ</b>\n\n"
+                f"{user1} и {user2} больше не состоят в браке.",
+                reply_markup=None,
+            )
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
+
+
 @dp.message(F.text)
 async def text_handler(message: Message):
     if not message.from_user:
@@ -251,6 +417,95 @@ async def text_handler(message: Message):
             f"Всего собрано: <b>{wallet['total_earned']} 🍯</b>\n"
             f"Раздач поймано: <b>{wallet['giveaways_claimed']}</b>\n"
             f"Самый большой улов: <b>{wallet['biggest_claim']} 🍯</b>"
+        )
+        return
+
+    # Предложение вступить в брак — ответом на сообщение участника.
+    if text in {"заключить брак", "предложить брак", "вступить в брак"}:
+        if not message.reply_to_message or not message.reply_to_message.from_user:
+            await message.reply(
+                "💍 Отправь <code>заключить брак</code> ответом на сообщение нужного человека."
+            )
+            return
+
+        actor = message.from_user
+        target = message.reply_to_message.from_user
+
+        if actor.id == target.id:
+            await message.reply("🐝 Нельзя заключить брак с самим собой :3")
+            return
+        if target.is_bot:
+            await message.reply("🐝 С ботами заключать брак нельзя.")
+            return
+
+        upsert_user(target.id, target.full_name)
+        proposal = create_proposal(message.chat.id, actor.id, target.id)
+
+        if proposal["status"] == "proposer_married":
+            await message.reply("💍 Ты уже состоишь в браке.")
+            return
+        if proposal["status"] == "target_married":
+            await message.reply("💍 Этот участник уже состоит в браке.")
+            return
+        if proposal["status"] == "already_pending":
+            await message.reply("💍 Между вами уже есть активное предложение брака.")
+            return
+        if proposal["status"] != "ok":
+            await message.reply("💍 Не удалось создать предложение брака.")
+            return
+
+        await message.answer(
+            "💍 <b>Предложение руки и сердца!</b>\n\n"
+            f"{mention(actor)} предлагает {mention(target)} вступить в брак.\n\n"
+            "❤️ Здоровье будущего брака: <b>100%</b>",
+            reply_markup=proposal_keyboard(proposal["proposal_id"]),
+        )
+        return
+
+    # Карточка текущего брака.
+    if text in {"брак", "мой брак", "наш брак"}:
+        marriage = get_active_marriage(message.from_user.id)
+        if not marriage:
+            await message.answer("💍 Ты пока не состоишь в браке.")
+            return
+
+        user1 = mention_by_id(marriage["user1_id"], marriage["user1_name"])
+        user2 = mention_by_id(marriage["user2_id"], marriage["user2_name"])
+        health = int(round(float(marriage["health"])))
+        age = format_marriage_age(marriage["started_at"])
+
+        await message.answer(
+            "💍 <b>Брак</b>\n\n"
+            f"{user1} ❤️ {user2}\n\n"
+            f"❤️ Здоровье брака: <b>{health}%</b>\n"
+            f"💕 Состояние: <b>{marriage_state(float(marriage['health']))}</b>\n"
+            f"🕒 Вместе: <b>{age}</b>"
+        )
+        return
+
+    # Ручной развод с подтверждением.
+    if text in {"развестись", "развод"}:
+        marriage = get_active_marriage(message.from_user.id)
+        if not marriage:
+            await message.answer("💍 Ты не состоишь в браке.")
+            return
+
+        partner_id = (
+            marriage["user2_id"]
+            if marriage["user1_id"] == message.from_user.id
+            else marriage["user1_id"]
+        )
+        partner_name = (
+            marriage["user2_name"]
+            if marriage["user1_id"] == message.from_user.id
+            else marriage["user1_name"]
+        )
+
+        await message.answer(
+            "💔 <b>Расторгнуть брак?</b>\n\n"
+            f"Ты действительно хочешь развестись с {mention_by_id(partner_id, partner_name)}?\n\n"
+            "Это действие потребует подтверждения.",
+            reply_markup=divorce_keyboard(marriage["id"], message.from_user.id),
         )
         return
 
@@ -381,6 +636,10 @@ async def text_handler(message: Message):
         points=points,
     )
 
+    # Обычные RP-действия между супругами поддерживают здоровье брака.
+    # 18+ команды отсутствуют в RP_HEALTH_GAINS и поэтому сюда не влияют.
+    marriage_health = apply_rp_health(actor.id, target.id, action_key)
+
     pair = get_pair(message.chat.id, actor.id, target.id)
 
     result_text = phrase
@@ -395,6 +654,15 @@ async def text_handler(message: Message):
         f"Всего: {pair['closeness']}</blockquote>"
     )
 
+    if marriage_health and marriage_health["gain"] > 0:
+        gain = marriage_health["gain"]
+        gain_text = f"{gain:.1f}".rstrip("0").rstrip(".")
+        current_health = int(round(marriage_health["new_health"]))
+        result_text += (
+            f"\n❤️ Здоровье брака: <b>+{gain_text}%</b> · "
+            f"Сейчас: <b>{current_health}%</b>"
+        )
+
     if rp_extra_text:
         # В двухстрочном формате отвечаем на сообщение с командой.
         # Поэтому Telegram сверху показывает цитату команды и второй строки,
@@ -408,6 +676,7 @@ async def text_handler(message: Message):
 async def main():
     init_db()
     init_honey_db()
+    init_marriage_db()
 
     # Демонстрационная раздача запускается только один раз после обновления.
     asyncio.create_task(maybe_launch_demo_once(bot))
@@ -423,7 +692,10 @@ async def main():
     # Каждая раздача автоматически закрывается через 1 час.
     asyncio.create_task(honey_expiration_scheduler(bot))
 
-    print("MurrlyBot honey update starting...")
+    # Раз в час пересчитываем очень медленный естественный спад здоровья браков.
+    asyncio.create_task(marriage_decay_scheduler())
+
+    print("MurrlyBot marriage update starting...")
     await dp.start_polling(bot)
 
 
