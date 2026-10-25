@@ -3,6 +3,7 @@ import random
 import asyncio
 import html
 import time
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -30,8 +31,11 @@ from honey import (
     honey_keyboard,
     giveaway_text,
     finished_text,
+    expired_text,
     maybe_launch_demo_once,
     honey_scheduler,
+    honey_expiration_scheduler,
+    refresh_active_giveaway_messages,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -162,6 +166,22 @@ async def honey_claim_handler(callback: CallbackQuery):
         await callback.answer("Мёдик уже разобрали 🍯", show_alert=True)
         return
 
+    if result["status"] == "expired":
+        await callback.answer("⏰ Раздача уже закончилась.", show_alert=True)
+        giveaway = get_giveaway(giveaway_id)
+        if callback.message and giveaway:
+            try:
+                await callback.message.edit_text(
+                    expired_text(
+                        giveaway["remaining"],
+                        giveaway["participants"],
+                    ),
+                    reply_markup=None,
+                )
+            except Exception as exc:
+                print(f"Honey expired message edit failed: {exc}")
+        return
+
     await callback.answer(f"+{result['amount']} 🍯 в твою копилку!")
 
     if callback.message:
@@ -174,8 +194,22 @@ async def honey_claim_handler(callback: CallbackQuery):
 
         try:
             if result["active"]:
+                giveaway = get_giveaway(giveaway_id)
+                closes_at = None
+                if giveaway and giveaway.get("expires_at"):
+                    try:
+                        closes_at = datetime.fromisoformat(
+                            giveaway["expires_at"]
+                        ).strftime("%H:%M")
+                    except Exception:
+                        closes_at = None
+
                 await callback.message.edit_text(
-                    giveaway_text(result["remaining"], demo=False),
+                    giveaway_text(
+                        result["remaining"],
+                        demo=(giveaway and giveaway.get("kind") == "demo"),
+                        closes_at=closes_at,
+                    ),
                     reply_markup=honey_keyboard(giveaway_id),
                 )
             else:
@@ -381,6 +415,13 @@ async def main():
     # Дальше бот работает штатно: одна случайная раздача 09:00–15:00
     # и одна случайная раздача 16:00–23:00 каждый день.
     asyncio.create_task(honey_scheduler(bot))
+
+    # Уже активные раздачи после обновления получают строку
+    # с точным временем закрытия. Новая демо-раздача не создаётся.
+    asyncio.create_task(refresh_active_giveaway_messages(bot))
+
+    # Каждая раздача автоматически закрывается через 1 час.
+    asyncio.create_task(honey_expiration_scheduler(bot))
 
     print("MurrlyBot honey update starting...")
     await dp.start_polling(bot)

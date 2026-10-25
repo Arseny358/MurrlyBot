@@ -1,7 +1,7 @@
 import asyncio
 import random
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -10,6 +10,7 @@ from database import connect
 HONEY_TOTAL = 300
 HONEY_MIN = 30
 HONEY_MAX = 40
+HONEY_DURATION_MINUTES = 60
 
 _demo_lock = asyncio.Lock()
 
@@ -42,6 +43,7 @@ def init_honey_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
             created_at TEXT NOT NULL,
+            expires_at TEXT,
             total_amount INTEGER NOT NULL DEFAULT 300,
             remaining INTEGER NOT NULL DEFAULT 300,
             active INTEGER NOT NULL DEFAULT 1,
@@ -66,6 +68,31 @@ def init_honey_db():
             value TEXT NOT NULL
         );
         """)
+
+        # Миграция: старые версии таблицы honey_giveaways не имели expires_at.
+        columns = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(honey_giveaways)").fetchall()
+        }
+        if "expires_at" not in columns:
+            con.execute("ALTER TABLE honey_giveaways ADD COLUMN expires_at TEXT")
+
+        # Для уже созданных раздач выставляем закрытие через час от created_at.
+        old_rows = con.execute("""
+            SELECT id, created_at
+            FROM honey_giveaways
+            WHERE expires_at IS NULL OR expires_at=''
+        """).fetchall()
+        for row in old_rows:
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+            except Exception:
+                created = datetime.now()
+            expires = created + timedelta(minutes=HONEY_DURATION_MINUTES)
+            con.execute(
+                "UPDATE honey_giveaways SET expires_at=? WHERE id=?",
+                (expires.isoformat(timespec="seconds"), row["id"]),
+            )
 
         # У старой версии не было отдельной таблицы чатов.
         # Берём уже знакомые чаты из существующей RP-статистики,
@@ -181,14 +208,20 @@ def honey_keyboard(giveaway_id: int):
     )
 
 
-def giveaway_text(remaining: int = HONEY_TOTAL, demo: bool = False):
+def giveaway_text(
+    remaining: int = HONEY_TOTAL,
+    demo: bool = False,
+    closes_at: str | None = None,
+):
     demo_line = "\n🧪 <i>Одноразовая демонстрационная раздача после обновления.</i>\n" if demo else ""
+    close_line = f"\n⏰ Раздача закроется в <b>{closes_at}</b>.\n" if closes_at else ""
     return (
         "🍯 <b>ВНЕЗАПНАЯ РАЗДАЧА МЁДИКА!</b>\n\n"
         "🐝 В улье появилась свежая партия мёдика!\n"
         f"{demo_line}\n"
         f"Всего в улье: <b>{HONEY_TOTAL} 🍯</b>\n"
-        f"Осталось: <b>{remaining} 🍯</b>\n\n"
+        f"Осталось: <b>{remaining} 🍯</b>\n"
+        f"{close_line}\n"
         f"Каждый может забрать один раз от <b>{HONEY_MIN} до {HONEY_MAX} 🍯</b>.\n"
         "Успей забрать свою долю!"
     )
@@ -203,25 +236,42 @@ def finished_text(participants: int):
     )
 
 
+def expired_text(remaining: int, participants: int):
+    collected = HONEY_TOTAL - remaining
+    return (
+        "🍯 <b>РАЗДАЧА ЗАВЕРШЕНА!</b>\n\n"
+        "⏰ Время раздачи истекло.\n\n"
+        f"Собрано: <b>{collected} 🍯</b>\n"
+        f"Осталось в улье: <b>{remaining} 🍯</b>\n"
+        f"Получили мёдик: <b>{participants}</b>"
+    )
+
+
 def create_giveaway(chat_id: int, kind: str, schedule_day: str, schedule_slot: str):
     try:
         with connect() as con:
+            created_at = datetime.now()
+            expires_at = created_at + timedelta(minutes=HONEY_DURATION_MINUTES)
             cur = con.execute("""
                 INSERT INTO honey_giveaways(
-                    chat_id, created_at, total_amount, remaining, active,
+                    chat_id, created_at, expires_at, total_amount, remaining, active,
                     kind, schedule_day, schedule_slot, participants
                 )
-                VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, 0)
             """, (
                 chat_id,
-                datetime.now().isoformat(timespec="seconds"),
+                created_at.isoformat(timespec="seconds"),
+                expires_at.isoformat(timespec="seconds"),
                 HONEY_TOTAL,
                 HONEY_TOTAL,
                 kind,
                 schedule_day,
                 schedule_slot,
             ))
-            return int(cur.lastrowid)
+            return {
+                "id": int(cur.lastrowid),
+                "expires_at": expires_at.isoformat(timespec="seconds"),
+            }
     except sqlite3.IntegrityError:
         return None
 
@@ -244,7 +294,7 @@ def get_giveaway(giveaway_id: int):
     with connect() as con:
         row = con.execute("""
             SELECT id, chat_id, total_amount, remaining, active, kind,
-                   participants, message_id
+                   participants, message_id, created_at, expires_at
             FROM honey_giveaways WHERE id=?
         """, (giveaway_id,)).fetchone()
     return dict(row) if row else None
@@ -256,13 +306,27 @@ def claim_honey(giveaway_id: int, user_id: int):
         con.execute("BEGIN IMMEDIATE")
 
         giveaway = con.execute("""
-            SELECT remaining, active, participants
+            SELECT remaining, active, participants, expires_at
             FROM honey_giveaways WHERE id=?
         """, (giveaway_id,)).fetchone()
 
         if not giveaway or not giveaway["active"] or giveaway["remaining"] <= 0:
             con.rollback()
             return {"status": "ended"}
+
+        if giveaway["expires_at"]:
+            try:
+                expires_at = datetime.fromisoformat(giveaway["expires_at"])
+            except Exception:
+                expires_at = None
+
+            if expires_at is not None and datetime.now() >= expires_at:
+                con.execute(
+                    "UPDATE honey_giveaways SET active=0 WHERE id=?",
+                    (giveaway_id,),
+                )
+                con.commit()
+                return {"status": "expired"}
 
         already = con.execute("""
             SELECT 1 FROM honey_claims
@@ -326,14 +390,21 @@ def claim_honey(giveaway_id: int, user_id: int):
 
 
 async def launch_giveaway(bot, chat_id: int, kind: str, schedule_day: str, schedule_slot: str):
-    giveaway_id = create_giveaway(chat_id, kind, schedule_day, schedule_slot)
-    if giveaway_id is None:
+    created = create_giveaway(chat_id, kind, schedule_day, schedule_slot)
+    if created is None:
         return False
+
+    giveaway_id = created["id"]
+    closes_at = datetime.fromisoformat(created["expires_at"]).strftime("%H:%M")
 
     try:
         message = await bot.send_message(
             chat_id,
-            giveaway_text(HONEY_TOTAL, demo=(kind == "demo")),
+            giveaway_text(
+                HONEY_TOTAL,
+                demo=(kind == "demo"),
+                closes_at=closes_at,
+            ),
             reply_markup=honey_keyboard(giveaway_id),
         )
         set_giveaway_message(giveaway_id, message.message_id)
@@ -382,6 +453,110 @@ async def maybe_launch_demo_once(bot, preferred_chat_id: int | None = None):
 
         if sent_any:
             _setting_set("honey_demo_v1_done", "1")
+
+
+async def refresh_active_giveaway_messages(bot):
+    """После обновления добавляет время закрытия в уже активные раздачи."""
+    now = datetime.now()
+    with connect() as con:
+        rows = con.execute("""
+            SELECT id, chat_id, remaining, kind, message_id, expires_at
+            FROM honey_giveaways
+            WHERE active=1 AND message_id IS NOT NULL AND expires_at IS NOT NULL
+        """).fetchall()
+
+    for row in rows:
+        try:
+            expires_at = datetime.fromisoformat(row["expires_at"])
+        except Exception:
+            continue
+
+        if now >= expires_at:
+            continue
+
+        try:
+            await bot.edit_message_text(
+                chat_id=row["chat_id"],
+                message_id=row["message_id"],
+                text=giveaway_text(
+                    int(row["remaining"]),
+                    demo=(row["kind"] == "demo"),
+                    closes_at=expires_at.strftime("%H:%M"),
+                ),
+                reply_markup=honey_keyboard(int(row["id"])),
+            )
+        except Exception as exc:
+            print(f"Honey active message refresh failed: {exc}")
+
+
+def get_expired_active_giveaways():
+    now = datetime.now()
+    with connect() as con:
+        rows = con.execute("""
+            SELECT id, chat_id, remaining, participants, message_id, expires_at
+            FROM honey_giveaways
+            WHERE active=1 AND expires_at IS NOT NULL
+        """).fetchall()
+
+    result = []
+    for row in rows:
+        try:
+            expires_at = datetime.fromisoformat(row["expires_at"])
+        except Exception:
+            continue
+        if now >= expires_at:
+            result.append(dict(row))
+    return result
+
+
+def close_giveaway_by_time(giveaway_id: int):
+    with connect() as con:
+        row = con.execute("""
+            SELECT remaining, participants, active
+            FROM honey_giveaways
+            WHERE id=?
+        """, (giveaway_id,)).fetchone()
+
+        if not row:
+            return None
+
+        con.execute(
+            "UPDATE honey_giveaways SET active=0 WHERE id=?",
+            (giveaway_id,),
+        )
+        return {
+            "remaining": int(row["remaining"]),
+            "participants": int(row["participants"]),
+            "was_active": bool(row["active"]),
+        }
+
+
+async def honey_expiration_scheduler(bot):
+    """Закрывает каждую раздачу через 1 час после её запуска."""
+    while True:
+        try:
+            for giveaway in get_expired_active_giveaways():
+                closed = close_giveaway_by_time(giveaway["id"])
+                if not closed or not closed["was_active"]:
+                    continue
+
+                if giveaway["message_id"]:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=giveaway["chat_id"],
+                            message_id=giveaway["message_id"],
+                            text=expired_text(
+                                closed["remaining"],
+                                closed["participants"],
+                            ),
+                            reply_markup=None,
+                        )
+                    except Exception as exc:
+                        print(f"Honey expiration message edit failed: {exc}")
+        except Exception as exc:
+            print(f"Honey expiration scheduler error: {exc}")
+
+        await asyncio.sleep(10)
 
 
 async def honey_scheduler(bot):
