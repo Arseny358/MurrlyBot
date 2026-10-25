@@ -271,7 +271,7 @@ ACTIONS = {
         "aliases": ["трахнуть", "трахни"],
         "points": (4, 7),
         "phrases": [
-            "😈 {actor} трахнул {target} к себе."
+            "😈 {actor} трахнул {target}."
         ],
     },
     "fuck_hard": {
@@ -279,7 +279,7 @@ ACTIONS = {
         "aliases": ["жестко трахнуть", "жёстко трахнуть", "трахнуть жестко", "трахнуть жёстко"],
         "points": (5, 8),
         "phrases": [
-            "🔥 {actor} жёстко трахнул {target} к себе."
+            "🔥 {actor} жёстко трахнул {target}."
         ],
     },
     "fuck_raw": {
@@ -287,7 +287,7 @@ ACTIONS = {
         "aliases": ["выебать", "выеби"],
         "points": (5, 8),
         "phrases": [
-            "🖤 {actor} грубо трахнул {target} к себе."
+            "🖤 {actor} грубо трахнул {target}."
         ],
     },
     "sex": {
