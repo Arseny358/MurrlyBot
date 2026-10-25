@@ -114,6 +114,13 @@ async def text_handler(message: Message):
     raw = message.text or ""
     text = normalize(raw)
 
+    # Второй формат RP-команд:
+    # 1-я строка — сама RP-команда.
+    # 2-я и последующие строки — дополнительная реплика/описание.
+    raw_lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    rp_command_text = normalize(raw_lines[0]) if raw_lines else ""
+    rp_extra_text = "\n".join(raw_lines[1:]).strip() if len(raw_lines) > 1 else ""
+
     if text.startswith("/"):
         return
 
@@ -199,7 +206,8 @@ async def text_handler(message: Message):
         return
 
     # RP-действия
-    action_key = NORMALIZED_ALIASES.get(text)
+    # Для двухстрочного формата командой считается только первая строка.
+    action_key = NORMALIZED_ALIASES.get(rp_command_text)
     if not action_key:
         return
 
@@ -247,10 +255,26 @@ async def text_handler(message: Message):
 
     pair = get_pair(message.chat.id, actor.id, target.id)
 
-    await message.answer(
-        phrase
-        + f"\n\n<blockquote>✨ +{points} близости · Всего: {pair['closeness']}</blockquote>"
+    result_text = phrase
+
+    # Если после команды была вторая строка — выводим её как реплику.
+    if rp_extra_text:
+        safe_extra = html.escape(rp_extra_text)
+        result_text += f'\n💬 С репликой: «{safe_extra}»'
+
+    result_text += (
+        f"\n\n<blockquote>✨ +{points} близости · "
+        f"Всего: {pair['closeness']}</blockquote>"
     )
+
+    if rp_extra_text:
+        # В двухстрочном формате отвечаем на сообщение с командой.
+        # Поэтому Telegram сверху показывает цитату команды и второй строки,
+        # как в Iris.
+        await message.reply(result_text)
+    else:
+        # Старый однострочный формат оставляем как был.
+        await message.answer(result_text)
 
 
 async def main():
