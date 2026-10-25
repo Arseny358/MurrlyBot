@@ -48,7 +48,9 @@ from gifts import (
     init_gifts_db,
     GIFT_CATALOG,
     shop_keyboard,
+    gift_inventory_keyboard,
     purchase_gift,
+    transfer_gift,
     get_gift_collection,
 )
 from marriage import (
@@ -159,12 +161,30 @@ def farm_card_text(user_link: str, farm: dict) -> str:
     return "\n".join(lines)
 
 
-def gift_shop_text(recipient_link: str, balance: int) -> str:
+def gift_shop_text(balance: int) -> str:
     return (
         "🎁 <b>Магазин подарков</b>\n\n"
-        f"Подарок для: {recipient_link}\n"
         f"Твой баланс: <b>{balance} 🍯</b>\n\n"
+        "Покупай подарки в свою коллекцию. "
+        "Потом их можно подарить другому участнику командой "
+        "<code>подарить</code> ответом на его сообщение.\n\n"
         "Выбери подарок:"
+    )
+
+
+def gift_send_text(recipient_link: str, collection: dict) -> str:
+    if not collection["items"]:
+        return (
+            "🎁 <b>Подарить</b>\n\n"
+            f"Получатель: {recipient_link}\n\n"
+            "У тебя пока нет подарков. Купи их командой <code>магазин</code>."
+        )
+
+    return (
+        "🎁 <b>Подарить</b>\n\n"
+        f"Получатель: {recipient_link}\n"
+        f"Подарков у тебя: <b>{collection['total']}</b>\n\n"
+        "Выбери, что хочешь подарить:"
     )
 
 
@@ -182,7 +202,7 @@ def gift_collection_text(user_link: str, collection: dict) -> str:
     return (
         f"🎁 <b>Подарки {user_link}</b>\n\n"
         + "\n".join(rows)
-        + f"\n\nВсего получено: <b>{collection['total']}</b>"
+        + f"\n\nВсего подарков: <b>{collection['total']}</b>"
     )
 
 
@@ -223,8 +243,9 @@ async def cmd_start(message: Message):
         "💔 <code>развестись</code> — расторгнуть брак\n"
         "🍯 <code>копилка</code> — твой запас мёдика\n"
         "🐝 <code>ферма</code> — медовая ферма\n"
-        "🎁 <code>магазин</code> — ответом на сообщение получателя\n"
-        "🎀 <code>подарки</code> — коллекция подарков"
+        "🎁 <code>магазин</code> — купить подарки себе\n"
+        "🎀 <code>подарки</code> — твоя коллекция подарков\n"
+        "💝 <code>подарить</code> — ответом на сообщение получателя"
     )
 
 
@@ -398,75 +419,141 @@ async def gift_callback_handler(callback: CallbackQuery):
         return
 
     parts = callback.data.split(":")
-    if len(parts) != 5 or parts[1] != "buy":
+    if len(parts) < 4:
         await callback.answer("Некорректный подарок.", show_alert=True)
         return
 
+    action = parts[1]
     gift_key = parts[2]
-    try:
-        recipient_id = int(parts[3])
-        giver_id = int(parts[4])
-    except ValueError:
-        await callback.answer("Некорректный подарок.", show_alert=True)
-        return
 
-    if callback.from_user.id != giver_id:
-        await callback.answer("🐝 Этот магазин открыт не тобой.", show_alert=True)
-        return
+    # Покупка подарка в собственную коллекцию.
+    if action == "buy":
+        if len(parts) != 4:
+            # Старые кнопки магазина из предыдущей версии больше не используем.
+            await callback.answer(
+                "Этот магазин устарел. Напиши «магазин» ещё раз.",
+                show_alert=True,
+            )
+            return
 
-    result = purchase_gift(giver_id, recipient_id, gift_key)
+        try:
+            buyer_id = int(parts[3])
+        except ValueError:
+            await callback.answer("Некорректный магазин.", show_alert=True)
+            return
 
-    if result["status"] == "insufficient":
+        if callback.from_user.id != buyer_id:
+            await callback.answer("🐝 Этот магазин открыт не тобой.", show_alert=True)
+            return
+
+        result = purchase_gift(buyer_id, gift_key)
+
+        if result["status"] == "insufficient":
+            await callback.answer(
+                f"Не хватает {result['need']} 🍯.",
+                show_alert=True,
+            )
+            return
+        if result["status"] != "ok":
+            await callback.answer("Не удалось купить подарок.", show_alert=True)
+            return
+
+        gift = result["gift"]
         await callback.answer(
-            f"Не хватает {result['need']} 🍯.",
-            show_alert=True,
-        )
-        return
-    if result["status"] != "ok":
-        await callback.answer("Не удалось купить подарок.", show_alert=True)
-        return
-
-    gift = result["gift"]
-    recipient = get_user(recipient_id)
-    recipient_link = mention_by_id(
-        recipient_id,
-        recipient["name"] if recipient else None,
-    )
-
-    marriage_health = apply_bonus_health(
-        giver_id,
-        recipient_id,
-        float(gift["health_bonus"]),
-    )
-
-    await callback.answer(f"{gift['emoji']} Подарок отправлен!")
-
-    if callback.message:
-        result_text = (
-            f"🎁 {mention(callback.from_user)} подарил {recipient_link} "
-            f"<b>{gift['name']}</b> {gift['emoji']}\n\n"
-            f"Стоимость: <b>{gift['price']} 🍯</b>\n"
-            f"У дарителя осталось: <b>{result['balance']} 🍯</b>\n"
-            f"У получателя теперь: <b>{result['recipient_count']}</b> шт."
+            f"{gift['emoji']} Куплено! Теперь у тебя {result['count']} шт."
         )
 
-        if marriage_health and marriage_health["gain"] > 0:
-            gain = marriage_health["gain"]
-            gain_text = f"{gain:.1f}".rstrip("0").rstrip(".")
-            current = int(round(marriage_health["new_health"]))
-            result_text += (
-                f"\n❤️ Здоровье брака: <b>+{gain_text}%</b> · "
-                f"Сейчас: <b>{current}%</b>"
+        if callback.message:
+            await callback.message.answer(
+                f"🛍 {mention(callback.from_user)} купил "
+                f"<b>{gift['name']}</b> {gift['emoji']} за "
+                f"<b>{gift['price']} 🍯</b>.\n\n"
+                f"Теперь в коллекции: <b>{result['count']} шт.</b>\n"
+                f"В копилке осталось: <b>{result['balance']} 🍯</b>"
             )
 
-        await callback.message.answer(result_text)
+            # Магазин остаётся открыт для следующих покупок.
+            await callback.message.edit_text(
+                gift_shop_text(result["balance"]),
+                reply_markup=shop_keyboard(buyer_id),
+            )
+        return
 
-        # Магазин остаётся открытым — можно подарить ещё что-нибудь.
-        await callback.message.edit_text(
-            gift_shop_text(recipient_link, result["balance"]),
-            reply_markup=shop_keyboard(giver_id, recipient_id),
+    # Передача уже купленного подарка другому участнику.
+    if action == "send":
+        if len(parts) != 5:
+            await callback.answer("Некорректная передача.", show_alert=True)
+            return
+
+        try:
+            recipient_id = int(parts[3])
+            giver_id = int(parts[4])
+        except ValueError:
+            await callback.answer("Некорректная передача.", show_alert=True)
+            return
+
+        if callback.from_user.id != giver_id:
+            await callback.answer(
+                "🐝 Этот список подарков открыт не тобой.",
+                show_alert=True,
+            )
+            return
+
+        result = transfer_gift(giver_id, recipient_id, gift_key)
+
+        if result["status"] == "not_owned":
+            await callback.answer(
+                "У тебя больше нет такого подарка.",
+                show_alert=True,
+            )
+            return
+        if result["status"] != "ok":
+            await callback.answer("Не удалось подарить подарок.", show_alert=True)
+            return
+
+        gift = result["gift"]
+        recipient = get_user(recipient_id)
+        recipient_link = mention_by_id(
+            recipient_id,
+            recipient["name"] if recipient else None,
         )
-    return
+
+        marriage_health = apply_bonus_health(
+            giver_id,
+            recipient_id,
+            float(gift["health_bonus"]),
+        )
+
+        await callback.answer(f"{gift['emoji']} Подарок отправлен!")
+
+        if callback.message:
+            result_text = (
+                f"🎁 {mention(callback.from_user)} подарил {recipient_link} "
+                f"<b>{gift['name']}</b> {gift['emoji']}\n\n"
+                f"У получателя теперь: <b>{result['recipient_count']} шт.</b>"
+            )
+
+            if marriage_health and marriage_health["gain"] > 0:
+                gain = marriage_health["gain"]
+                gain_text = f"{gain:.1f}".rstrip("0").rstrip(".")
+                current = int(round(marriage_health["new_health"]))
+                result_text += (
+                    f"\n❤️ Здоровье брака: <b>+{gain_text}%</b> · "
+                    f"Сейчас: <b>{current}%</b>"
+                )
+
+            await callback.message.answer(result_text)
+
+            # Обновляем список оставшихся подарков дарителя.
+            collection = get_gift_collection(giver_id)
+            keyboard = gift_inventory_keyboard(giver_id, recipient_id)
+            await callback.message.edit_text(
+                gift_send_text(recipient_link, collection),
+                reply_markup=keyboard,
+            )
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("marriage:"))
@@ -658,29 +745,42 @@ async def text_handler(message: Message):
         )
         return
 
-    # Магазин подарков — открывается ответом на сообщение получателя.
-    if text in {"магазин", "магазин подарков", "подарить подарок"}:
+    # Магазин подарков — открывается обычной командой без reply.
+    if text in {"магазин", "магазин подарков"}:
+        wallet = get_wallet(message.from_user.id)
+
+        await message.answer(
+            gift_shop_text(wallet["balance"]),
+            reply_markup=shop_keyboard(message.from_user.id),
+        )
+        return
+
+    # Передача подарка — ответом на сообщение получателя.
+    if text in {"подарить", "подарить подарок"}:
         if not message.reply_to_message or not message.reply_to_message.from_user:
             await message.reply(
-                "🎁 Отправь <code>магазин</code> ответом на сообщение человека, "
-                "которому хочешь сделать подарок."
+                "🎁 Отправь <code>подарить</code> ответом на сообщение человека, "
+                "которому хочешь передать подарок."
             )
             return
 
         target = message.reply_to_message.from_user
         if target.id == message.from_user.id:
-            await message.reply("🎁 Подарки из магазина предназначены другим участникам.")
+            await message.reply("🎁 Нельзя подарить подарок самому себе.")
             return
         if target.is_bot:
             await message.reply("🐝 Ботам подарки пока дарить нельзя.")
             return
 
         upsert_user(target.id, target.full_name)
-        wallet = get_wallet(message.from_user.id)
+        collection = get_gift_collection(message.from_user.id)
 
         await message.answer(
-            gift_shop_text(mention(target), wallet["balance"]),
-            reply_markup=shop_keyboard(message.from_user.id, target.id),
+            gift_send_text(mention(target), collection),
+            reply_markup=gift_inventory_keyboard(
+                message.from_user.id,
+                target.id,
+            ),
         )
         return
 
