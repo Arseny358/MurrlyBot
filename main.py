@@ -11,7 +11,7 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode, ChatType
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message, CallbackQuery
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.methods import SendMessage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -187,6 +187,16 @@ last_action_time = {}
 
 class ProfileEdit(StatesGroup):
     waiting_value = State()
+
+
+async def safe_edit_text(message, text: str, reply_markup=None):
+    """Игнорирует безвредную ошибку Telegram, если сообщение уже имеет тот же текст/кнопки."""
+    try:
+        return await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return None
+        raise
 
 
 def normalize(text: str) -> str:
@@ -808,7 +818,8 @@ async def farm_callback_handler(callback: CallbackQuery):
 
         farm = result["farm"]
         if callback.message:
-            await callback.message.edit_text(
+            await safe_edit_text(
+                callback.message,
                 farm_card_text(mention(callback.from_user), farm),
                 reply_markup=farm_keyboard(owner_id, farm),
             )
@@ -837,7 +848,8 @@ async def farm_callback_handler(callback: CallbackQuery):
 
         farm = result["farm"]
         if callback.message:
-            await callback.message.edit_text(
+            await safe_edit_text(
+                callback.message,
                 farm_card_text(mention(callback.from_user), farm),
                 reply_markup=farm_keyboard(owner_id, farm),
             )

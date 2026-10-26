@@ -7,7 +7,7 @@ from database import connect
 from honey import BOT_TIME_OFFSET_HOURS
 
 
-EVENT_DURATION_MINUTES = 120
+EVENT_DURATION_MINUTES = 60
 EVENT_HOUR = 23
 EVENT_MINUTE = 0
 
