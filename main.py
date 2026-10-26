@@ -3,6 +3,7 @@ import random
 import asyncio
 import html
 import time
+from collections import defaultdict, deque
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
@@ -10,6 +11,8 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode, ChatType
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message, CallbackQuery
+from aiogram.exceptions import TelegramRetryAfter
+from aiogram.methods import SendMessage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -103,6 +106,79 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
+
+# Ограничитель исходящих сообщений Telegram.
+# В группе бот не должен отправлять слишком много сообщений за короткий промежуток:
+# Telegram рекомендует не превышать ~1 сообщение/сек. в один чат
+# и не более 20 сообщений/мин. в группе.
+_group_send_locks = defaultdict(asyncio.Lock)
+_group_send_times = defaultdict(deque)
+
+
+async def _wait_for_group_send_slot(chat_id: int):
+    times = _group_send_times[chat_id]
+
+    while True:
+        now = time.monotonic()
+
+        # Удаляем отправки старше минуты.
+        while times and now - times[0] >= 60.0:
+            times.popleft()
+
+        delay = 0.0
+
+        # Не чаще одного исходящего SendMessage примерно в секунду.
+        if times:
+            delay = max(delay, 1.05 - (now - times[-1]))
+
+        # Не больше 20 сообщений за последние 60 секунд.
+        if len(times) >= 20:
+            delay = max(delay, 60.10 - (now - times[0]))
+
+        if delay <= 0:
+            return
+
+        await asyncio.sleep(delay)
+
+
+@bot.session.middleware()
+async def telegram_rate_limit_middleware(make_request, current_bot, method):
+    """
+    Защищает весь бот от Telegram 429/Flood control.
+
+    SendMessage в группах ставятся в общую очередь для конкретного чата.
+    Если Telegram всё же вернул RetryAfter, ждём указанное им время
+    и повторяем запрос вместо того, чтобы выбрасывать ошибку в handler.
+    """
+    chat_id = getattr(method, "chat_id", None)
+    is_group_send = (
+        isinstance(method, SendMessage)
+        and isinstance(chat_id, int)
+        and chat_id < 0
+    )
+
+    async def send_with_retry():
+        while True:
+            try:
+                return await make_request(current_bot, method)
+            except TelegramRetryAfter as exc:
+                wait_seconds = max(1.0, float(exc.retry_after)) + 0.5
+                print(
+                    f"Telegram flood control: chat={chat_id}, "
+                    f"retry_after={exc.retry_after}s"
+                )
+                await asyncio.sleep(wait_seconds)
+
+    if not is_group_send:
+        return await send_with_retry()
+
+    # Все SendMessage одного группового чата проходят последовательно.
+    async with _group_send_locks[chat_id]:
+        await _wait_for_group_send_slot(chat_id)
+        result = await send_with_retry()
+        _group_send_times[chat_id].append(time.monotonic())
+        return result
+
 
 # Короткий антиспам только для RP-действий.
 COOLDOWN_SECONDS = 2.0
@@ -343,6 +419,50 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await cmd_start(message)
+
+
+async def send_profile_card(message: Message):
+    if not message.from_user:
+        return
+
+    upsert_user(message.from_user.id, message.from_user.full_name)
+    await remember_group_chat(message)
+
+    target = (
+        message.reply_to_message.from_user
+        if message.reply_to_message and message.reply_to_message.from_user
+        else message.from_user
+    )
+
+    if target.is_bot:
+        await message.reply("👤 У ботов анкеты нет.")
+        return
+
+    upsert_user(target.id, target.full_name)
+    profile = get_profile(target.id)
+    is_owner = target.id == message.from_user.id
+
+    await message.answer(
+        profile_card_text(mention(target), profile),
+        reply_markup=(
+            profile_view_keyboard(
+                target.id,
+                filled=not profile_is_empty(profile),
+            )
+            if is_owner
+            else None
+        ),
+    )
+
+
+@dp.message(Command("profile"))
+async def cmd_profile(message: Message):
+    await send_profile_card(message)
+
+
+@dp.message(Command("anketa"))
+async def cmd_anketa(message: Message):
+    await send_profile_card(message)
 
 
 @dp.callback_query(F.data.startswith("profile:"))
@@ -1031,6 +1151,20 @@ async def profile_value_handler(message: Message, state: FSMContext):
         return
 
     raw = (message.text or "").strip()
+    normalized_raw = normalize(raw).split("@", 1)[0]
+
+    # Команда анкеты должна работать даже если пользователь остался
+    # внутри режима редактирования какого-либо поля.
+    if normalized_raw in {
+        "анкета",
+        "моя анкета",
+        "/анкета",
+        "/profile",
+        "/anketa",
+    }:
+        await state.clear()
+        await send_profile_card(message)
+        return
 
     if raw == "-":
         value = None
@@ -1105,15 +1239,19 @@ async def text_handler(message: Message):
     rp_command_text = normalize(raw_lines[0]) if raw_lines else ""
     rp_extra_text = "\n".join(raw_lines[1:]).strip() if len(raw_lines) > 1 else ""
 
-    if text.startswith("/"):
-        return
+    # Анкета обрабатывается ДО общего отсечения slash-команд.
+    # Поэтому работают и обычные сообщения "анкета", и варианты /анкета, /profile, /anketa.
+    profile_alias = text.split("@", 1)[0]
+    if profile_alias in {
+        "анкета",
+        "моя анкета",
+        "/анкета",
+        "/profile",
+        "/anketa",
+    }:
+        upsert_user(message.from_user.id, message.from_user.full_name)
+        await remember_group_chat(message)
 
-    upsert_user(message.from_user.id, message.from_user.full_name)
-    await remember_group_chat(message)
-
-    # Анкета пользователя.
-    # Без reply — своя, ответом на сообщение — анкета автора сообщения.
-    if text in {"анкета", "моя анкета"}:
         target = (
             message.reply_to_message.from_user
             if message.reply_to_message and message.reply_to_message.from_user
@@ -1140,6 +1278,12 @@ async def text_handler(message: Message):
             ),
         )
         return
+
+    if text.startswith("/"):
+        return
+
+    upsert_user(message.from_user.id, message.from_user.full_name)
+    await remember_group_chat(message)
 
     # Копилка мёдика
     if text in {"копилка", "мой медик", "мой мёдик", "медик", "мёдик"}:
