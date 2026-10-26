@@ -79,6 +79,8 @@ from profiles import (
     gender_keyboard,
     profile_cancel_keyboard,
 )
+
+from legacy_import import import_legacy_data_once
 from marriage import (
     init_marriage_db,
     proposal_keyboard,
@@ -1632,6 +1634,7 @@ async def main():
     init_gifts_db()
     init_mass_event_db()
     init_profiles_db()
+    import_legacy_data_once()
 
     # Демонстрационная раздача запускается только один раз после обновления.
     asyncio.create_task(maybe_launch_demo_once(bot))
