@@ -4,7 +4,7 @@ import asyncio
 import html
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -74,13 +74,18 @@ from profiles import (
     get_profile,
     profile_is_empty,
     set_profile_field,
+    touch_chat_member,
+    record_member_join,
+    record_chat_message,
+    get_chat_activity,
+    get_extended_profile_stats,
     profile_view_keyboard,
+    profile_stats_keyboard,
     profile_edit_keyboard,
     gender_keyboard,
     profile_cancel_keyboard,
 )
 
-from legacy_import import import_legacy_data_once
 from marriage import (
     init_marriage_db,
     proposal_keyboard,
@@ -321,7 +326,42 @@ def gift_collection_text(user_link: str, collection: dict) -> str:
     )
 
 
-def profile_card_text(user_link: str, profile: dict) -> str:
+def _profile_duration_text(activity: dict) -> str:
+    days = int(activity.get("membership_days") or 0)
+    if activity.get("membership_exact"):
+        if days == 0:
+            return "сегодня"
+        return f"{days} дн."
+
+    if not activity.get("first_seen_at"):
+        return "пока нет данных"
+
+    if days == 0:
+        return "сегодня"
+    return f"{days} дн."
+
+
+def _profile_last_seen_text(value: str | None) -> str:
+    if not value:
+        return "пока нет данных"
+    try:
+        dt = datetime.fromisoformat(value)
+    except Exception:
+        return "неизвестно"
+
+    now = datetime.utcnow() + timedelta(hours=3)
+    if dt.date() == now.date():
+        return f"сегодня в {dt:%H:%M}"
+    if dt.date() == (now - timedelta(days=1)).date():
+        return f"вчера в {dt:%H:%M}"
+    return dt.strftime("%d.%m.%Y в %H:%M")
+
+
+def profile_card_text(
+    user_link: str,
+    profile: dict,
+    activity: dict | None = None,
+) -> str:
     def safe(value, empty="не указано"):
         if value is None or value == "":
             return f"<i>{empty}</i>"
@@ -338,10 +378,127 @@ def profile_card_text(user_link: str, profile: dict) -> str:
         f"📝 <b>О себе:</b>\n{safe(profile.get('bio'))}",
     ]
 
+    if activity is not None:
+        duration_label = (
+            "📅 В группе"
+            if activity.get("membership_exact")
+            else "👀 Бот наблюдает"
+        )
+        rank = (
+            f" · 🏆 #{activity['rank_30d']}"
+            if activity.get("rank_30d")
+            else ""
+        )
+        lines.extend([
+            "",
+            "──────────────",
+            "📊 <b>Активность в этом чате</b>",
+            f"{duration_label}: <b>{_profile_duration_text(activity)}</b>",
+            f"💬 Сообщений: <b>{activity.get('message_count', 0)}</b>",
+            f"🔥 За 7 дней: <b>{activity.get('messages_7d', 0)}</b>",
+            f"⭐ {activity.get('activity_level', '🌙 Тихоня')}{rank}",
+        ])
+
     if profile_is_empty(profile):
         lines.extend([
             "",
             "Анкета пока не заполнена.",
+        ])
+
+    return "\n".join(lines)
+
+
+def profile_stats_text(user_link: str, stats: dict) -> str:
+    activity = stats["activity"]
+    rp = stats["rp"]
+    honey = stats["honey"]
+    gifts = stats["gifts"]
+    marriage = stats.get("marriage")
+
+    duration_label = (
+        "📅 В группе"
+        if activity.get("membership_exact")
+        else "👀 Бот наблюдает"
+    )
+    rank_text = (
+        f"#{activity['rank_30d']} из активных участников"
+        if activity.get("rank_30d")
+        else "пока без места"
+    )
+    weekday = activity.get("busiest_weekday") or "пока нет данных"
+
+    favorite_action = rp.get("favorite_action")
+    favorite_action_text = (
+        f"{favorite_action['title']} — {favorite_action['count']} раз"
+        if favorite_action
+        else "пока нет"
+    )
+
+    closest = rp.get("closest_partner")
+    closest_text = (
+        f"{mention_by_id(closest['user_id'], closest['name'])} "
+        f"— {closest['closeness']} близости"
+        if closest
+        else "пока нет"
+    )
+
+    farm_text = (
+        f"{stats['farm_level']} уровень"
+        if stats.get("farm_level") is not None
+        else "ещё не создана"
+    )
+
+    lines = [
+        f"📊 <b>Расширенная анкета {user_link}</b>",
+        "",
+        "<b>Активность в чате</b>",
+        f"{duration_label}: <b>{_profile_duration_text(activity)}</b>",
+        f"💬 Всего сообщений: <b>{activity['message_count']}</b>",
+        f"🔥 За 7 дней: <b>{activity['messages_7d']}</b>",
+        f"📈 За 30 дней: <b>{activity['messages_30d']}</b>",
+        f"⭐ Уровень: <b>{activity['activity_level']}</b>",
+        f"🏆 Место за 30 дней: <b>{rank_text}</b>",
+        f"🔥 Серия активности: <b>{activity['streak_days']} дн.</b>",
+        f"📊 Среднее: <b>{activity['average_per_day']:.1f} сообщ./день</b>",
+        f"📆 Самый активный день: <b>{html.escape(weekday)}</b>",
+        f"🕒 Последняя активность: <b>{_profile_last_seen_text(activity.get('last_seen_at'))}</b>",
+        "",
+        "<b>💞 RP-статистика</b>",
+        f"🎭 RP-действий: <b>{rp['total_actions']}</b>",
+        f"❤️ Общая близость: <b>{rp['total_closeness']}</b>",
+        f"👥 RP-партнёров: <b>{rp['partners']}</b>",
+        f"🌹 Любимое действие: <b>{favorite_action_text}</b>",
+        f"💗 Самая близкая связь: {closest_text}",
+        "",
+        "<b>🍯 Мёдик и подарки</b>",
+        f"🍯 Баланс: <b>{honey['balance']} 🍯</b>",
+        f"📦 Всего заработано: <b>{honey['total_earned']} 🍯</b>",
+        f"🐝 Ферма: <b>{farm_text}</b>",
+        f"🎁 Подарков отправлено: <b>{gifts['sent']}</b>",
+        f"🎀 Подарков получено: <b>{gifts['received']}</b>",
+    ]
+
+    if marriage:
+        lines.extend([
+            "",
+            "<b>💍 Отношения</b>",
+            f"❤️ В браке с: {mention_by_id(marriage['partner_id'], marriage['partner_name'])}",
+            f"📅 Вместе: <b>{stats.get('marriage_days', 0)} дн.</b>",
+            f"💗 Здоровье брака: <b>{int(round(marriage['health']))}%</b>",
+        ])
+
+    lines.extend(["", "<b>🏅 Достижения</b>"])
+    achievements = stats.get("achievements") or []
+    if achievements:
+        lines.extend(f"• {item}" for item in achievements)
+    else:
+        lines.append("<i>Пока нет открытых достижений.</i>")
+
+    if not activity.get("membership_exact"):
+        lines.extend([
+            "",
+            "<i>ℹ️ Для старых участников Telegram не отдаёт боту историческую дату вступления. "
+            "Поэтому «Бот наблюдает» считается с момента, когда эта версия впервые увидела пользователя.</i>",
         ])
 
     return "\n".join(lines)
@@ -405,6 +562,8 @@ async def remember_group_chat(message: Message):
 async def cmd_start(message: Message):
     upsert_user(message.from_user.id, message.from_user.full_name)
     await remember_group_chat(message)
+    if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        record_chat_message(message.chat.id, message.from_user.id)
     await message.answer(
         "🐝 <b>MurrlyBot работает!</b>\n\n"
         "Это RP-бот для групповых чатов.\n"
@@ -433,6 +592,43 @@ async def cmd_help(message: Message):
     await cmd_start(message)
 
 
+@dp.message(F.new_chat_members)
+async def new_chat_members_handler(message: Message):
+    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+
+    await remember_group_chat(message)
+
+    for member in message.new_chat_members or []:
+        if member.is_bot:
+            continue
+        upsert_user(member.id, member.full_name)
+        record_member_join(message.chat.id, member.id)
+
+
+@dp.message(
+    F.photo
+    | F.video
+    | F.sticker
+    | F.animation
+    | F.document
+    | F.voice
+    | F.video_note
+    | F.audio
+)
+async def activity_media_handler(message: Message):
+    if (
+        not message.from_user
+        or message.from_user.is_bot
+        or message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}
+    ):
+        return
+
+    upsert_user(message.from_user.id, message.from_user.full_name)
+    await remember_group_chat(message)
+    record_chat_message(message.chat.id, message.from_user.id)
+
+
 async def send_profile_card(message: Message):
     if not message.from_user:
         return
@@ -454,15 +650,28 @@ async def send_profile_card(message: Message):
     profile = get_profile(target.id)
     is_owner = target.id == message.from_user.id
 
+    chat_id = None
+    activity = None
+    if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        chat_id = message.chat.id
+
+        # Сама команда анкеты тоже является активностью пользователя.
+        record_chat_message(chat_id, message.from_user.id)
+
+        # Если смотрим чужую анкету, просто запоминаем человека,
+        # но не прибавляем ему сообщение.
+        if target.id != message.from_user.id:
+            touch_chat_member(chat_id, target.id)
+
+        activity = get_chat_activity(chat_id, target.id)
+
     await message.answer(
-        profile_card_text(mention(target), profile),
-        reply_markup=(
-            profile_view_keyboard(
-                target.id,
-                filled=not profile_is_empty(profile),
-            )
-            if is_owner
-            else None
+        profile_card_text(mention(target), profile, activity),
+        reply_markup=profile_view_keyboard(
+            target.id,
+            filled=not profile_is_empty(profile),
+            chat_id=chat_id,
+            is_owner=is_owner,
         ),
     )
 
@@ -488,6 +697,60 @@ async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
         return
 
     action = parts[1]
+
+    # profile:stats:<user_id>:<chat_id>
+    # profile:back:<user_id>:<chat_id>
+    if action in {"stats", "back"}:
+        if len(parts) != 4:
+            await callback.answer("Некорректная анкета.", show_alert=True)
+            return
+
+        try:
+            target_id = int(parts[2])
+            chat_id = int(parts[3])
+        except ValueError:
+            await callback.answer("Некорректная анкета.", show_alert=True)
+            return
+
+        if not callback.message or callback.message.chat.id != chat_id:
+            await callback.answer(
+                "Эта кнопка относится к другому чату.",
+                show_alert=True,
+            )
+            return
+
+        stored_user = get_user(target_id)
+        user_link = mention_by_id(
+            target_id,
+            stored_user["name"] if stored_user else "Пользователь",
+        )
+
+        if action == "stats":
+            stats = get_extended_profile_stats(chat_id, target_id)
+            await callback.answer()
+            await safe_edit_text(
+                callback.message,
+                profile_stats_text(user_link, stats),
+                reply_markup=profile_stats_keyboard(target_id, chat_id),
+            )
+            return
+
+        profile = get_profile(target_id)
+        activity = get_chat_activity(chat_id, target_id)
+        is_owner = callback.from_user.id == target_id
+
+        await callback.answer()
+        await safe_edit_text(
+            callback.message,
+            profile_card_text(user_link, profile, activity),
+            reply_markup=profile_view_keyboard(
+                target_id,
+                filled=not profile_is_empty(profile),
+                chat_id=chat_id,
+                is_owner=is_owner,
+            ),
+        )
+        return
 
     # profile:edit:<user_id>
     if action in {"edit", "done", "cancel"}:
@@ -526,11 +789,24 @@ async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Анкета сохранена.")
             profile = get_profile(owner_id)
             if callback.message:
-                await callback.message.edit_text(
-                    profile_card_text(user_link, profile),
+                chat_id = (
+                    callback.message.chat.id
+                    if callback.message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
+                    else None
+                )
+                activity = (
+                    get_chat_activity(chat_id, owner_id)
+                    if chat_id is not None
+                    else None
+                )
+                await safe_edit_text(
+                    callback.message,
+                    profile_card_text(user_link, profile, activity),
                     reply_markup=profile_view_keyboard(
                         owner_id,
                         filled=not profile_is_empty(profile),
+                        chat_id=chat_id,
+                        is_owner=True,
                     ),
                 )
             return
@@ -540,11 +816,24 @@ async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Редактирование отменено.")
             profile = get_profile(owner_id)
             if callback.message:
-                await callback.message.edit_text(
-                    profile_card_text(user_link, profile),
+                chat_id = (
+                    callback.message.chat.id
+                    if callback.message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
+                    else None
+                )
+                activity = (
+                    get_chat_activity(chat_id, owner_id)
+                    if chat_id is not None
+                    else None
+                )
+                await safe_edit_text(
+                    callback.message,
+                    profile_card_text(user_link, profile, activity),
                     reply_markup=profile_view_keyboard(
                         owner_id,
                         filled=not profile_is_empty(profile),
+                        chat_id=chat_id,
+                        is_owner=True,
                     ),
                 )
             return
@@ -1180,6 +1469,9 @@ async def profile_value_handler(message: Message, state: FSMContext):
         await send_profile_card(message)
         return
 
+    if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        record_chat_message(message.chat.id, message.from_user.id)
+
     if raw == "-":
         value = None
     elif field == "age":
@@ -1254,7 +1546,6 @@ async def text_handler(message: Message):
     rp_extra_text = "\n".join(raw_lines[1:]).strip() if len(raw_lines) > 1 else ""
 
     # Анкета обрабатывается ДО общего отсечения slash-команд.
-    # Поэтому работают и обычные сообщения "анкета", и варианты /анкета, /profile, /anketa.
     profile_alias = text.split("@", 1)[0]
     if profile_alias in {
         "анкета",
@@ -1263,34 +1554,7 @@ async def text_handler(message: Message):
         "/profile",
         "/anketa",
     }:
-        upsert_user(message.from_user.id, message.from_user.full_name)
-        await remember_group_chat(message)
-
-        target = (
-            message.reply_to_message.from_user
-            if message.reply_to_message and message.reply_to_message.from_user
-            else message.from_user
-        )
-
-        if target.is_bot:
-            await message.reply("👤 У ботов анкеты нет.")
-            return
-
-        upsert_user(target.id, target.full_name)
-        profile = get_profile(target.id)
-        is_owner = target.id == message.from_user.id
-
-        await message.answer(
-            profile_card_text(mention(target), profile),
-            reply_markup=(
-                profile_view_keyboard(
-                    target.id,
-                    filled=not profile_is_empty(profile),
-                )
-                if is_owner
-                else None
-            ),
-        )
+        await send_profile_card(message)
         return
 
     if text.startswith("/"):
@@ -1298,6 +1562,9 @@ async def text_handler(message: Message):
 
     upsert_user(message.from_user.id, message.from_user.full_name)
     await remember_group_chat(message)
+
+    if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        record_chat_message(message.chat.id, message.from_user.id)
 
     # Копилка мёдика
     if text in {"копилка", "мой медик", "мой мёдик", "медик", "мёдик"}:
@@ -1634,7 +1901,6 @@ async def main():
     init_gifts_db()
     init_mass_event_db()
     init_profiles_db()
-    import_legacy_data_once()
 
     # Демонстрационная раздача запускается только один раз после обновления.
     asyncio.create_task(maybe_launch_demo_once(bot))
@@ -1656,10 +1922,10 @@ async def main():
     # RP-событие запускается только штатно: каждый день в 23:00.
     asyncio.create_task(mass_event_scheduler(bot))
 
-    # Событие закрывается через 2 часа после запуска.
+    # Событие закрывается через 1 час после запуска.
     asyncio.create_task(mass_event_expiration_scheduler(bot))
 
-    print("MurrlyBot profiles update starting...")
+    print("MurrlyBot extended profiles update starting...")
     await dp.start_polling(bot)
 
 
