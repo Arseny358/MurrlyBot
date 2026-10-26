@@ -10,6 +10,8 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode, ChatType
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 from rp_actions import ACTIONS, ALIASES
 from database import (
@@ -63,6 +65,17 @@ from mass_event import (
     mass_event_scheduler,
     mass_event_expiration_scheduler,
 )
+from profiles import (
+    PROFILE_FIELDS,
+    init_profiles_db,
+    get_profile,
+    profile_is_empty,
+    set_profile_field,
+    profile_view_keyboard,
+    profile_edit_keyboard,
+    gender_keyboard,
+    profile_cancel_keyboard,
+)
 from marriage import (
     init_marriage_db,
     proposal_keyboard,
@@ -94,6 +107,10 @@ dp = Dispatcher()
 # Короткий антиспам только для RP-действий.
 COOLDOWN_SECONDS = 2.0
 last_action_time = {}
+
+
+class ProfileEdit(StatesGroup):
+    waiting_value = State()
 
 
 def normalize(text: str) -> str:
@@ -216,6 +233,69 @@ def gift_collection_text(user_link: str, collection: dict) -> str:
     )
 
 
+def profile_card_text(user_link: str, profile: dict) -> str:
+    def safe(value, empty="не указано"):
+        if value is None or value == "":
+            return f"<i>{empty}</i>"
+        return html.escape(str(value))
+
+    lines = [
+        f"👤 <b>Анкета {user_link}</b>",
+        "",
+        f"🏷 Имя / ник: <b>{safe(profile.get('display_name'))}</b>",
+        f"🎂 Возраст: <b>{safe(profile.get('age'))}</b>",
+        f"🏙 Город: <b>{safe(profile.get('city'))}</b>",
+        f"⚧ Пол: <b>{safe(profile.get('gender'))}</b>",
+        "",
+        f"📝 <b>О себе:</b>\n{safe(profile.get('bio'))}",
+    ]
+
+    if profile_is_empty(profile):
+        lines.extend([
+            "",
+            "Анкета пока не заполнена.",
+        ])
+
+    return "\n".join(lines)
+
+
+def profile_edit_menu_text(user_link: str, profile: dict) -> str:
+    return (
+        f"✏️ <b>Редактирование анкеты {user_link}</b>\n\n"
+        "Выбери поле, которое хочешь изменить.\n"
+        "Текущие данные сохраняются автоматически."
+    )
+
+
+def profile_field_prompt(field: str) -> str:
+    prompts = {
+        "display_name": (
+            "🏷 <b>Имя / ник</b>\n\n"
+            "Отправь имя или ник, который будет отображаться в анкете.\n"
+            "Максимум 40 символов."
+        ),
+        "age": (
+            "🎂 <b>Возраст</b>\n\n"
+            "Отправь возраст числом от 1 до 120."
+        ),
+        "city": (
+            "🏙 <b>Город</b>\n\n"
+            "Отправь название города.\n"
+            "Максимум 60 символов."
+        ),
+        "bio": (
+            "📝 <b>О себе</b>\n\n"
+            "Напиши несколько слов о себе.\n"
+            "Максимум 400 символов."
+        ),
+    }
+
+    base = prompts.get(field, "Отправь новое значение.")
+    return base + "\n\nЧтобы очистить поле, отправь <code>-</code>."
+
+
+
+
 async def remember_group_chat(message: Message):
     if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         chat_type = (
@@ -255,13 +335,169 @@ async def cmd_start(message: Message):
         "🐝 <code>ферма</code> — медовая ферма\n"
         "🎁 <code>магазин</code> — купить подарки себе\n"
         "🎀 <code>подарки</code> — твоя коллекция подарков\n"
-        "💝 <code>подарить</code> — ответом на сообщение получателя"
+        "💝 <code>подарить</code> — ответом на сообщение получателя\n"
+        "👤 <code>анкета</code> — твоя анкета или анкета пользователя через reply"
     )
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await cmd_start(message)
+
+
+@dp.callback_query(F.data.startswith("profile:"))
+async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
+    if not callback.from_user or not callback.data:
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Некорректное действие.", show_alert=True)
+        return
+
+    action = parts[1]
+
+    # profile:edit:<user_id>
+    if action in {"edit", "done", "cancel"}:
+        if len(parts) != 3:
+            await callback.answer("Некорректное действие.", show_alert=True)
+            return
+
+        try:
+            owner_id = int(parts[2])
+        except ValueError:
+            await callback.answer("Некорректная анкета.", show_alert=True)
+            return
+
+        if callback.from_user.id != owner_id:
+            await callback.answer(
+                "🐝 Редактировать можно только свою анкету.",
+                show_alert=True,
+            )
+            return
+
+        profile = get_profile(owner_id)
+        user_link = mention(callback.from_user)
+
+        if action == "edit":
+            await state.clear()
+            await callback.answer()
+            if callback.message:
+                await callback.message.edit_text(
+                    profile_edit_menu_text(user_link, profile),
+                    reply_markup=profile_edit_keyboard(owner_id),
+                )
+            return
+
+        if action == "done":
+            await state.clear()
+            await callback.answer("Анкета сохранена.")
+            profile = get_profile(owner_id)
+            if callback.message:
+                await callback.message.edit_text(
+                    profile_card_text(user_link, profile),
+                    reply_markup=profile_view_keyboard(
+                        owner_id,
+                        filled=not profile_is_empty(profile),
+                    ),
+                )
+            return
+
+        if action == "cancel":
+            await state.clear()
+            await callback.answer("Редактирование отменено.")
+            profile = get_profile(owner_id)
+            if callback.message:
+                await callback.message.edit_text(
+                    profile_card_text(user_link, profile),
+                    reply_markup=profile_view_keyboard(
+                        owner_id,
+                        filled=not profile_is_empty(profile),
+                    ),
+                )
+            return
+
+    # profile:field:<field>:<user_id>
+    if action == "field":
+        if len(parts) != 4:
+            await callback.answer("Некорректное поле.", show_alert=True)
+            return
+
+        field = parts[2]
+        try:
+            owner_id = int(parts[3])
+        except ValueError:
+            await callback.answer("Некорректная анкета.", show_alert=True)
+            return
+
+        if callback.from_user.id != owner_id:
+            await callback.answer(
+                "🐝 Редактировать можно только свою анкету.",
+                show_alert=True,
+            )
+            return
+
+        if field not in PROFILE_FIELDS:
+            await callback.answer("Неизвестное поле.", show_alert=True)
+            return
+
+        await state.clear()
+
+        if field == "gender":
+            await callback.answer()
+            if callback.message:
+                await callback.message.edit_text(
+                    "⚧ <b>Пол</b>\n\nВыбери вариант:",
+                    reply_markup=gender_keyboard(owner_id),
+                )
+            return
+
+        await state.set_state(ProfileEdit.waiting_value)
+        await state.update_data(field=field, owner_id=owner_id)
+        await callback.answer()
+
+        if callback.message:
+            await callback.message.edit_text(
+                profile_field_prompt(field),
+                reply_markup=profile_cancel_keyboard(owner_id),
+            )
+        return
+
+    # profile:gender:<value>:<user_id>
+    if action == "gender":
+        if len(parts) != 4:
+            await callback.answer("Некорректный выбор.", show_alert=True)
+            return
+
+        raw_value = parts[2]
+        try:
+            owner_id = int(parts[3])
+        except ValueError:
+            await callback.answer("Некорректная анкета.", show_alert=True)
+            return
+
+        if callback.from_user.id != owner_id:
+            await callback.answer(
+                "🐝 Редактировать можно только свою анкету.",
+                show_alert=True,
+            )
+            return
+
+        value = None if raw_value == "clear" else raw_value
+        set_profile_field(owner_id, "gender", value)
+        await state.clear()
+
+        profile = get_profile(owner_id)
+        await callback.answer("Поле сохранено.")
+
+        if callback.message:
+            await callback.message.edit_text(
+                profile_edit_menu_text(mention(callback.from_user), profile),
+                reply_markup=profile_edit_keyboard(owner_id),
+            )
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("massorgy:"))
@@ -780,6 +1016,80 @@ async def marriage_callback_handler(callback: CallbackQuery):
     await callback.answer("Неизвестное действие.", show_alert=True)
 
 
+@dp.message(ProfileEdit.waiting_value, F.text)
+async def profile_value_handler(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+
+    data = await state.get_data()
+    field = data.get("field")
+    owner_id = data.get("owner_id")
+
+    if owner_id != message.from_user.id or field not in PROFILE_FIELDS:
+        await state.clear()
+        await message.answer("Анкета: редактирование сброшено.")
+        return
+
+    raw = (message.text or "").strip()
+
+    if raw == "-":
+        value = None
+    elif field == "age":
+        try:
+            value = int(raw)
+        except ValueError:
+            await message.answer(
+                "🎂 Возраст нужно отправить числом от 1 до 120.\n"
+                "Или отправь <code>-</code>, чтобы очистить поле."
+            )
+            return
+
+        if not 1 <= value <= 120:
+            await message.answer("🎂 Укажи возраст от 1 до 120.")
+            return
+
+    elif field == "display_name":
+        if not raw:
+            await message.answer("Имя / ник не может быть пустым.")
+            return
+        if len(raw) > 40:
+            await message.answer("🏷 Максимальная длина имени / ника — 40 символов.")
+            return
+        value = raw
+
+    elif field == "city":
+        if not raw:
+            await message.answer("Название города не может быть пустым.")
+            return
+        if len(raw) > 60:
+            await message.answer("🏙 Максимальная длина города — 60 символов.")
+            return
+        value = raw
+
+    elif field == "bio":
+        if not raw:
+            await message.answer("Текст «О себе» не может быть пустым.")
+            return
+        if len(raw) > 400:
+            await message.answer("📝 Максимальная длина поля «О себе» — 400 символов.")
+            return
+        value = raw
+
+    else:
+        await state.clear()
+        return
+
+    set_profile_field(owner_id, field, value)
+    await state.clear()
+
+    profile = get_profile(owner_id)
+    await message.answer(
+        "✅ <b>Поле сохранено.</b>\n\n"
+        + profile_card_text(mention(message.from_user), profile),
+        reply_markup=profile_edit_keyboard(owner_id),
+    )
+
+
 @dp.message(F.text)
 async def text_handler(message: Message):
     if not message.from_user:
@@ -800,6 +1110,36 @@ async def text_handler(message: Message):
 
     upsert_user(message.from_user.id, message.from_user.full_name)
     await remember_group_chat(message)
+
+    # Анкета пользователя.
+    # Без reply — своя, ответом на сообщение — анкета автора сообщения.
+    if text in {"анкета", "моя анкета"}:
+        target = (
+            message.reply_to_message.from_user
+            if message.reply_to_message and message.reply_to_message.from_user
+            else message.from_user
+        )
+
+        if target.is_bot:
+            await message.reply("👤 У ботов анкеты нет.")
+            return
+
+        upsert_user(target.id, target.full_name)
+        profile = get_profile(target.id)
+        is_owner = target.id == message.from_user.id
+
+        await message.answer(
+            profile_card_text(mention(target), profile),
+            reply_markup=(
+                profile_view_keyboard(
+                    target.id,
+                    filled=not profile_is_empty(profile),
+                )
+                if is_owner
+                else None
+            ),
+        )
+        return
 
     # Копилка мёдика
     if text in {"копилка", "мой медик", "мой мёдик", "медик", "мёдик"}:
@@ -1135,6 +1475,7 @@ async def main():
     init_farm_db()
     init_gifts_db()
     init_mass_event_db()
+    init_profiles_db()
 
     # Демонстрационная раздача запускается только один раз после обновления.
     asyncio.create_task(maybe_launch_demo_once(bot))
@@ -1156,10 +1497,10 @@ async def main():
     # RP-событие запускается только штатно: каждый день в 23:00.
     asyncio.create_task(mass_event_scheduler(bot))
 
-    # Событие закрывается через час после запуска.
+    # Событие закрывается через 2 часа после запуска.
     asyncio.create_task(mass_event_expiration_scheduler(bot))
 
-    print("MurrlyBot mass RP event update starting...")
+    print("MurrlyBot profiles update starting...")
     await dp.start_polling(bot)
 
 
