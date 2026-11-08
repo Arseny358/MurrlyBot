@@ -3,9 +3,10 @@ from datetime import datetime
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from database import connect
+from config import get_float, get_int
 
 
-GIFT_CATALOG = {
+BASE_GIFT_CATALOG = {
     "rose": {
         "emoji": "🌹",
         "name": "Роза",
@@ -76,7 +77,7 @@ def init_gifts_db():
 
 def shop_keyboard(buyer_id: int):
     rows = []
-    items = list(GIFT_CATALOG.items())
+    items = list(get_gift_catalog().items())
 
     for i in range(0, len(items), 2):
         row = []
@@ -109,7 +110,7 @@ def gift_inventory_keyboard(giver_id: int, recipient_id: int):
 
 def purchase_gift(buyer_id: int, gift_key: str):
     """Покупает подарок в личный инвентарь покупателя."""
-    gift = GIFT_CATALOG.get(gift_key)
+    gift = get_gift(gift_key)
     if not gift:
         return {"status": "missing"}
 
@@ -176,7 +177,7 @@ def purchase_gift(buyer_id: int, gift_key: str):
 
 def transfer_gift(giver_id: int, recipient_id: int, gift_key: str):
     """Передаёт один уже купленный подарок из инвентаря другому пользователю."""
-    gift = GIFT_CATALOG.get(gift_key)
+    gift = get_gift(gift_key)
     if not gift:
         return {"status": "missing"}
 
@@ -267,7 +268,7 @@ def get_gift_collection(user_id: int):
 
     items = []
     for row in rows:
-        gift = GIFT_CATALOG.get(row["gift_key"])
+        gift = get_gift(row["gift_key"])
         if not gift:
             continue
         items.append({
@@ -280,3 +281,23 @@ def get_gift_collection(user_id: int):
         "items": items,
         "total": int(total["total"]),
     }
+
+
+def get_gift_catalog():
+    result = {}
+    for key, base in BASE_GIFT_CATALOG.items():
+        result[key] = {
+            **base,
+            "price": get_int(f"gift.{key}.price", int(base["price"])),
+            "health_bonus": get_float(
+                f"gift.{key}.health_bonus", float(base["health_bonus"])
+            ),
+        }
+    return result
+
+
+def get_gift(gift_key: str):
+    return get_gift_catalog().get(gift_key)
+
+# Совместимость со старым импортом из main.py.
+GIFT_CATALOG = BASE_GIFT_CATALOG

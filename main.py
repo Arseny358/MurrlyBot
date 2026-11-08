@@ -37,7 +37,6 @@ from honey import (
     giveaway_text,
     finished_text,
     expired_text,
-    maybe_launch_demo_once,
     honey_scheduler,
     honey_expiration_scheduler,
     refresh_active_giveaway_messages,
@@ -51,22 +50,11 @@ from farm import (
 )
 from gifts import (
     init_gifts_db,
-    GIFT_CATALOG,
     shop_keyboard,
     gift_inventory_keyboard,
     purchase_gift,
     transfer_gift,
     get_gift_collection,
-)
-from mass_event import (
-    init_mass_event_db,
-    get_event as get_mass_event,
-    join_event as join_mass_event,
-    event_keyboard as mass_event_keyboard,
-    event_text as mass_event_text,
-    finished_event_text as mass_event_finished_text,
-    mass_event_scheduler,
-    mass_event_expiration_scheduler,
 )
 from profiles import (
     PROFILE_FIELDS,
@@ -104,6 +92,11 @@ from marriage import (
     marriage_decay_scheduler,
 )
 
+from config import init_config_db, get_int
+from vip import init_vip_db, get_vip_status, purchase_vip, vip_keyboard
+from backup import backup_scheduler
+from admin_panel import register_admin_handlers
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не найдена.")
@@ -113,6 +106,7 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
+register_admin_handlers(dp)
 
 # Ограничитель исходящих сообщений Telegram.
 # В группе бот не должен отправлять слишком много сообщений за короткий промежуток:
@@ -265,6 +259,12 @@ def farm_card_text(user_link: str, farm: dict) -> str:
         f"📦 В сотах: <b>{stored} / {farm['capacity']} 🍯</b>",
     ]
 
+    if farm.get("vip_active"):
+        lines.append(
+            f"👑 VIP-бонус: производство {farm['base_production']} → {farm['production']} · "
+            f"вместимость {farm['base_capacity']} → {farm['capacity']}"
+        )
+
     if stored >= int(farm["capacity"]):
         lines.append("⚠️ <b>Соты заполнены — производство остановлено.</b>")
 
@@ -326,6 +326,42 @@ def gift_collection_text(user_link: str, collection: dict) -> str:
     )
 
 
+def vip_card_text(user_link: str, user_id: int) -> str:
+    status = get_vip_status(user_id)
+    d7 = get_int("vip.days.7", 7)
+    d30 = get_int("vip.days.30", 30)
+    p7 = get_int("vip.price.7", 250)
+    p30 = get_int("vip.price.30", 750)
+    prod = get_int("vip.farm_production_bonus_pct", 20)
+    cap = get_int("vip.farm_capacity_bonus_pct", 25)
+    giveaway = get_int("vip.giveaway_bonus_pct", 10)
+
+    if status.get("active"):
+        try:
+            until = datetime.fromisoformat(status["expires_at"]).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            until = "неизвестно"
+        state = (
+            "Статус: <b>✅ активен</b>\n"
+            f"Действует до: <b>{until}</b>\n"
+            f"Осталось: <b>{status['remaining_days']} дн. {status['remaining_hours']} ч.</b>"
+        )
+    else:
+        state = "Статус: <b>не активен</b>"
+
+    return (
+        f"👑 <b>VIP {user_link}</b>\n\n"
+        f"{state}\n\n"
+        "<b>Бонусы:</b>\n"
+        f"🐝 Производство фермы: <b>+{prod}%</b>\n"
+        f"📦 Вместимость фермы: <b>+{cap}%</b>\n"
+        f"🍯 Порция в раздаче: <b>+{giveaway}%</b>\n\n"
+        f"{d7} дней — <b>{p7} 🍯</b>\n"
+        f"{d30} дней — <b>{p30} 🍯</b>"
+    )
+
+
+
 def _profile_duration_text(activity: dict) -> str:
     days = int(activity.get("membership_days") or 0)
     if activity.get("membership_exact"):
@@ -361,6 +397,7 @@ def profile_card_text(
     user_link: str,
     profile: dict,
     activity: dict | None = None,
+    user_id: int | None = None,
 ) -> str:
     def safe(value, empty="не указано"):
         if value is None or value == "":
@@ -377,6 +414,15 @@ def profile_card_text(
         "",
         f"📝 <b>О себе:</b>\n{safe(profile.get('bio'))}",
     ]
+
+    if user_id is not None:
+        vip = get_vip_status(user_id)
+        if vip.get("active"):
+            try:
+                vip_until = datetime.fromisoformat(vip["expires_at"]).strftime("%d.%m.%Y")
+            except Exception:
+                vip_until = "активен"
+            lines.extend(["", f"👑 <b>VIP</b> · до <b>{vip_until}</b>"])
 
     if activity is not None:
         duration_label = (
@@ -414,6 +460,7 @@ def profile_stats_text(user_link: str, stats: dict) -> str:
     honey = stats["honey"]
     gifts = stats["gifts"]
     marriage = stats.get("marriage")
+    vip = stats.get("vip")
 
     duration_label = (
         "📅 В группе"
@@ -487,6 +534,17 @@ def profile_stats_text(user_link: str, stats: dict) -> str:
             f"💗 Здоровье брака: <b>{int(round(marriage['health']))}%</b>",
         ])
 
+    if vip and vip.get("active"):
+        try:
+            vip_until = datetime.fromisoformat(vip["expires_at"]).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            vip_until = "неизвестно"
+        lines.extend([
+            "",
+            "<b>👑 VIP</b>",
+            f"Действует до: <b>{vip_until}</b>",
+        ])
+
     lines.extend(["", "<b>🏅 Достижения</b>"])
     achievements = stats.get("achievements") or []
     if achievements:
@@ -553,9 +611,6 @@ async def remember_group_chat(message: Message):
             chat_type,
             message.chat.title or "",
         )
-        # Если после обновления бот ещё не успел найти знакомый чат,
-        # первая новая активность в группе запустит одноразовые демонстрации.
-        await maybe_launch_demo_once(bot, message.chat.id)
 
 
 @dp.message(Command("start"))
@@ -590,6 +645,17 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await cmd_start(message)
+
+
+@dp.message(Command("vip"))
+async def cmd_vip(message: Message):
+    if not message.from_user:
+        return
+    upsert_user(message.from_user.id, message.from_user.full_name)
+    await message.answer(
+        vip_card_text(mention(message.from_user), message.from_user.id),
+        reply_markup=vip_keyboard(message.from_user.id),
+    )
 
 
 @dp.message(F.new_chat_members)
@@ -666,7 +732,7 @@ async def send_profile_card(message: Message):
         activity = get_chat_activity(chat_id, target.id)
 
     await message.answer(
-        profile_card_text(mention(target), profile, activity),
+        profile_card_text(mention(target), profile, activity, target.id),
         reply_markup=profile_view_keyboard(
             target.id,
             filled=not profile_is_empty(profile),
@@ -727,6 +793,7 @@ async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
 
         if action == "stats":
             stats = get_extended_profile_stats(chat_id, target_id)
+            stats["vip"] = get_vip_status(target_id)
             await callback.answer()
             await safe_edit_text(
                 callback.message,
@@ -742,7 +809,7 @@ async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         await safe_edit_text(
             callback.message,
-            profile_card_text(user_link, profile, activity),
+            profile_card_text(user_link, profile, activity, target_id),
             reply_markup=profile_view_keyboard(
                 target_id,
                 filled=not profile_is_empty(profile),
@@ -801,7 +868,7 @@ async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
                 )
                 await safe_edit_text(
                     callback.message,
-                    profile_card_text(user_link, profile, activity),
+                    profile_card_text(user_link, profile, activity, owner_id),
                     reply_markup=profile_view_keyboard(
                         owner_id,
                         filled=not profile_is_empty(profile),
@@ -828,7 +895,7 @@ async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
                 )
                 await safe_edit_text(
                     callback.message,
-                    profile_card_text(user_link, profile, activity),
+                    profile_card_text(user_link, profile, activity, owner_id),
                     reply_markup=profile_view_keyboard(
                         owner_id,
                         filled=not profile_is_empty(profile),
@@ -921,71 +988,46 @@ async def profile_callback_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Неизвестное действие.", show_alert=True)
 
 
-@dp.callback_query(F.data.startswith("massorgy:"))
-async def mass_orgy_callback_handler(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("vip:"))
+async def vip_callback_handler(callback: CallbackQuery):
     if not callback.from_user or not callback.data:
         return
-
     parts = callback.data.split(":")
-    if len(parts) != 3 or parts[1] != "join":
-        await callback.answer("Некорректное событие.", show_alert=True)
+    if len(parts) != 4 or parts[1] != "buy":
+        await callback.answer("Некорректное действие VIP.", show_alert=True)
         return
-
     try:
-        event_id = int(parts[2])
+        days = int(parts[2])
+        owner_id = int(parts[3])
     except ValueError:
-        await callback.answer("Некорректное событие.", show_alert=True)
+        await callback.answer("Некорректное действие VIP.", show_alert=True)
+        return
+    if callback.from_user.id != owner_id:
+        await callback.answer("👑 Эта кнопка предназначена не тебе.", show_alert=True)
         return
 
-    upsert_user(callback.from_user.id, callback.from_user.full_name)
-    result = join_mass_event(event_id, callback.from_user.id)
+    result = purchase_vip(owner_id, days)
+    if result["status"] == "disabled":
+        await callback.answer("VIP временно отключён администратором.", show_alert=True)
+        return
+    if result["status"] == "insufficient":
+        await callback.answer(f"Не хватает {result['need']} 🍯.", show_alert=True)
+        return
+    if result["status"] != "ok":
+        await callback.answer("Не удалось купить VIP.", show_alert=True)
+        return
 
-    if result["status"] == "already":
-        await callback.answer(
-            "🔥 Ты уже участвуешь в этом событии.",
-            show_alert=True,
+    await callback.answer(f"👑 VIP продлён на {result['days']} дней!")
+    if callback.message:
+        await callback.message.answer(
+            f"👑 {mention(callback.from_user)} активировал VIP на <b>{result['days']} дней</b> за "
+            f"<b>{result['price']} 🍯</b>.\nОсталось в копилке: <b>{result['balance']} 🍯</b>"
         )
-        return
-
-    if result["status"] == "ended":
-        await callback.answer(
-            "⏰ Событие уже завершено.",
-            show_alert=True,
+        await safe_edit_text(
+            callback.message,
+            vip_card_text(mention(callback.from_user), owner_id),
+            reply_markup=vip_keyboard(owner_id),
         )
-
-        event = get_mass_event(event_id)
-        if callback.message and event:
-            try:
-                await callback.message.edit_text(
-                    mass_event_finished_text(event["participants"]),
-                    reply_markup=None,
-                )
-            except Exception as exc:
-                print(f"Mass orgy expired edit failed: {exc}")
-        return
-
-    await callback.answer("🔥 Ты присоединился к событию!")
-
-    event = get_mass_event(event_id)
-    if callback.message and event:
-        closes_at = None
-        try:
-            closes_at = datetime.fromisoformat(
-                event["expires_at"]
-            ).strftime("%H:%M")
-        except Exception:
-            pass
-
-        try:
-            await callback.message.edit_text(
-                mass_event_text(
-                    participants=result["participants"],
-                    closes_at=closes_at,
-                ),
-                reply_markup=mass_event_keyboard(event_id),
-            )
-        except Exception as exc:
-            print(f"Mass orgy participant edit failed: {exc}")
 
 
 @dp.callback_query(F.data.startswith("honey:"))
@@ -1022,6 +1064,7 @@ async def honey_claim_handler(callback: CallbackQuery):
                     expired_text(
                         giveaway["remaining"],
                         giveaway["participants"],
+                        giveaway["total_amount"],
                     ),
                     reply_markup=None,
                 )
@@ -1033,8 +1076,9 @@ async def honey_claim_handler(callback: CallbackQuery):
 
     if callback.message:
         user_link = mention(callback.from_user)
+        bonus_line = " <b>👑 VIP-бонус!</b>" if result.get("vip_bonus") else ""
         await callback.message.answer(
-            f"🍯 {user_link} забрал <b>{result['amount']} мёдика!</b>\n\n"
+            f"🍯 {user_link} забрал <b>{result['amount']} мёдика!</b>{bonus_line}\n\n"
             f"В копилке: <b>{result['balance']} 🍯</b>\n"
             f"В улье осталось: <b>{result['remaining']} 🍯</b>"
         )
@@ -1054,14 +1098,14 @@ async def honey_claim_handler(callback: CallbackQuery):
                 await callback.message.edit_text(
                     giveaway_text(
                         result["remaining"],
-                        demo=(giveaway and giveaway.get("kind") == "demo"),
                         closes_at=closes_at,
+                        total_amount=(giveaway["total_amount"] if giveaway else result.get("total_amount")),
                     ),
                     reply_markup=honey_keyboard(giveaway_id),
                 )
             else:
                 await callback.message.edit_text(
-                    finished_text(result["participants"]),
+                    finished_text(result["participants"], result.get("total_amount")),
                     reply_markup=None,
                 )
         except Exception as exc:
@@ -1525,7 +1569,7 @@ async def profile_value_handler(message: Message, state: FSMContext):
     profile = get_profile(owner_id)
     await message.answer(
         "✅ <b>Поле сохранено.</b>\n\n"
-        + profile_card_text(mention(message.from_user), profile),
+        + profile_card_text(mention(message.from_user), profile, user_id=owner_id),
         reply_markup=profile_edit_keyboard(owner_id),
     )
 
@@ -1575,6 +1619,14 @@ async def text_handler(message: Message):
             f"Всего собрано: <b>{wallet['total_earned']} 🍯</b>\n"
             f"Раздач поймано: <b>{wallet['giveaways_claimed']}</b>\n"
             f"Самый большой улов: <b>{wallet['biggest_claim']} 🍯</b>"
+        )
+        return
+
+    # VIP
+    if text in {"vip", "вип", "мой vip", "мой вип"}:
+        await message.answer(
+            vip_card_text(mention(message.from_user), message.from_user.id),
+            reply_markup=vip_keyboard(message.from_user.id),
         )
         return
 
@@ -1895,37 +1947,29 @@ async def text_handler(message: Message):
 
 async def main():
     init_db()
+    init_config_db()
     init_honey_db()
     init_marriage_db()
+    init_vip_db()
     init_farm_db()
     init_gifts_db()
-    init_mass_event_db()
     init_profiles_db()
 
-    # Демонстрационная раздача запускается только один раз после обновления.
-    asyncio.create_task(maybe_launch_demo_once(bot))
-
-    # Дальше бот работает штатно: одна случайная раздача 09:00–15:00
-    # и одна случайная раздача 16:00–23:00 каждый день.
+    # Только штатные раздачи по расписанию из админ-панели.
+    # Одноразовая демо-раздача после обновления удалена.
     asyncio.create_task(honey_scheduler(bot))
 
-    # Уже активные раздачи после обновления получают строку
-    # с точным временем закрытия. Новая демо-раздача не создаётся.
+    # Восстанавливаем интерфейс уже активных раздач после рестарта.
     asyncio.create_task(refresh_active_giveaway_messages(bot))
-
-    # Каждая раздача автоматически закрывается через 1 час.
     asyncio.create_task(honey_expiration_scheduler(bot))
 
-    # Раз в час пересчитываем очень медленный естественный спад здоровья браков.
+    # Естественный спад здоровья браков.
     asyncio.create_task(marriage_decay_scheduler())
 
-    # RP-событие запускается только штатно: каждый день в 23:00.
-    asyncio.create_task(mass_event_scheduler(bot))
+    # Собственный бэкап базы, независимый от функции Bothost.
+    asyncio.create_task(backup_scheduler(bot))
 
-    # Событие закрывается через 1 час после запуска.
-    asyncio.create_task(mass_event_expiration_scheduler(bot))
-
-    print("MurrlyBot extended profiles update starting...")
+    print("MurrlyBot admin + VIP + backup update starting...")
     await dp.start_polling(bot)
 
 
