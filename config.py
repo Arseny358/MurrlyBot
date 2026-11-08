@@ -60,6 +60,9 @@ DEFAULT_CONFIG = {
     "vip.farm_capacity_bonus_pct": "25",
     "vip.giveaway_bonus_pct": "10",
 
+    # Правила чата
+    "rules.text": "Правила пока не опубликованы.",
+
     # Бэкапы
     "backup.auto_enabled": "0",
     "backup.hour": "04:00",

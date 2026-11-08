@@ -92,7 +92,7 @@ from marriage import (
     marriage_decay_scheduler,
 )
 
-from config import init_config_db, get_int
+from config import init_config_db, get_int, get_setting
 from vip import init_vip_db, get_vip_status, purchase_vip, vip_keyboard
 from backup import backup_scheduler
 from admin_panel import register_admin_handlers
@@ -638,13 +638,22 @@ async def cmd_start(message: Message):
         "🎁 <code>магазин</code> — купить подарки себе\n"
         "🎀 <code>подарки</code> — твоя коллекция подарков\n"
         "💝 <code>подарить</code> — ответом на сообщение получателя\n"
-        "👤 <code>анкета</code> — твоя анкета или анкета пользователя через reply"
+        "👤 <code>анкета</code> — твоя анкета или анкета пользователя через reply\n"
+        "📜 <code>правила</code> — правила чата"
     )
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await cmd_start(message)
+
+
+@dp.message(Command("rules"))
+async def cmd_rules(message: Message):
+    rules = get_setting("rules.text", "Правила пока не опубликованы.") or "Правила пока не опубликованы."
+    await message.answer(
+        "📜 <b>ПРАВИЛА ЧАТА</b>\n\n" + html.escape(str(rules))
+    )
 
 
 @dp.message(Command("vip"))
@@ -1599,6 +1608,13 @@ async def text_handler(message: Message):
         "/anketa",
     }:
         await send_profile_card(message)
+        return
+
+    if text in {"правила", "rules", "/правила"}:
+        rules = get_setting("rules.text", "Правила пока не опубликованы.") or "Правила пока не опубликованы."
+        await message.answer(
+            "📜 <b>ПРАВИЛА ЧАТА</b>\n\n" + html.escape(str(rules))
+        )
         return
 
     if text.startswith("/"):

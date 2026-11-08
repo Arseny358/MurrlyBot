@@ -64,8 +64,8 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🐝 Ферма", "admin:farm"), _btn("🎉 Раздачи", "admin:honey")],
         [_btn("🎁 Подарки", "admin:gifts"), _btn("👑 VIP", "admin:vip")],
-        [_btn("📊 Статистика", "admin:stats"), _btn("📋 Журнал", "admin:audit")],
-        [_btn("⚙️ Система и бэкап", "admin:system")],
+        [_btn("📜 Правила", "admin:rules"), _btn("📊 Статистика", "admin:stats")],
+        [_btn("📋 Журнал", "admin:audit"), _btn("⚙️ Система и бэкап", "admin:system")],
         [_btn("🚪 Выйти", "admin:logout")],
     ])
 
@@ -195,6 +195,23 @@ def vip_keyboard():
     ])
 
 
+
+def rules_text():
+    current = get_setting("rules.text", "Правила пока не опубликованы.") or "Правила пока не опубликованы."
+    return (
+        "📜 <b>ПРАВИЛА ЧАТА</b>\n\n"
+        f"{html.escape(str(current))}\n\n"
+        "Текст сохраняется в SQLite и сразу обновляется для команды <code>Правила</code>."
+    )
+
+
+def rules_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✏️ Изменить правила", "admin:edit:rules.text")],
+        _back(),
+    ])
+
+
 def system_text():
     auto = "✅ включён" if get_bool("backup.auto_enabled", False) else "⏸ выключен"
     return (
@@ -239,6 +256,7 @@ EDITABLE = {
     "vip.giveaway_bonus_pct": ("integer", 0, 500, "VIP-бонус раздачи", "vip"),
     "backup.hour": ("time", None, None, "Время автобэкапа", "system"),
     "backup.keep_local": ("integer", 1, 100, "Количество локальных бэкапов", "system"),
+    "rules.text": ("text", 1, 3500, "Правила чата", "rules"),
 }
 for gift_key, item in BASE_GIFT_CATALOG.items():
     EDITABLE[f"gift.{gift_key}.price"] = ("integer", 0, 10000000, f"Цена: {item['name']}", f"gift:{gift_key}")
@@ -269,6 +287,8 @@ def _section_payload(section: str):
         return vip_text(), vip_keyboard()
     if section == "system":
         return system_text(), system_keyboard()
+    if section == "rules":
+        return rules_text(), rules_keyboard()
     if section.startswith("gift:"):
         key = section.split(":", 1)[1]
         return gift_detail_text(key), gift_detail_keyboard(key)
@@ -336,26 +356,41 @@ async def admin_value_handler(message: Message, state: FSMContext):
         await state.clear()
         return
     value_type, min_v, max_v, label, section = EDITABLE[key]
-    raw = (message.text or "").strip().replace(",", ".")
+    raw = (message.text or "").strip()
+    numeric_raw = raw.replace(",", ".")
 
     try:
         if value_type == "integer":
-            value = int(raw)
+            value = int(numeric_raw)
         elif value_type == "float":
-            value = float(raw)
+            value = float(numeric_raw)
         elif value_type == "time":
             value = _parse_time(raw)
             if value is None:
                 raise ValueError
+        elif value_type == "text":
+            value = raw
+            if not value:
+                raise ValueError
         else:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Некорректное значение. Для времени используй формат <code>HH:MM</code>.")
+        if value_type == "text":
+            await message.answer("❌ Текст не может быть пустым.")
+        else:
+            await message.answer("❌ Некорректное значение. Для времени используй формат <code>HH:MM</code>.")
         return
 
     if value_type in {"integer", "float"}:
-        if min_v is not None and value < min_v or max_v is not None and value > max_v:
+        if (min_v is not None and value < min_v) or (max_v is not None and value > max_v):
             await message.answer(f"❌ Допустимый диапазон: {min_v}–{max_v}.")
+            return
+    elif value_type == "text":
+        if min_v is not None and len(value) < min_v:
+            await message.answer(f"❌ Минимальная длина текста: {min_v} символ.")
+            return
+        if max_v is not None and len(value) > max_v:
+            await message.answer(f"❌ Правила слишком длинные. Максимум: {max_v} символов.")
             return
 
     # Связанные проверки раздачи.
@@ -395,10 +430,16 @@ async def admin_value_handler(message: Message, state: FSMContext):
 
     await state.clear()
     text, kb = _section_payload(section)
-    await message.answer(
-        f"✅ <b>{html.escape(label)}</b> изменено: <code>{html.escape(str(old))}</code> → <code>{html.escape(str(new))}</code>\n\n{text}",
-        reply_markup=kb,
-    )
+    if value_type == "text":
+        await message.answer(
+            f"✅ <b>{html.escape(label)}</b> обновлены.\n\n{text}",
+            reply_markup=kb,
+        )
+    else:
+        await message.answer(
+            f"✅ <b>{html.escape(label)}</b> изменено: <code>{html.escape(str(old))}</code> → <code>{html.escape(str(new))}</code>\n\n{text}",
+            reply_markup=kb,
+        )
 
 
 async def admin_callback_handler(callback: CallbackQuery, state: FSMContext):
@@ -436,6 +477,10 @@ async def admin_callback_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         await _safe_edit(callback.message, vip_text(), vip_keyboard())
         return
+    if action == "rules":
+        await callback.answer()
+        await _safe_edit(callback.message, rules_text(), rules_keyboard())
+        return
     if action == "system":
         await callback.answer()
         await _safe_edit(callback.message, system_text(), system_keyboard())
@@ -458,13 +503,21 @@ async def admin_callback_handler(callback: CallbackQuery, state: FSMContext):
         value_type, min_v, max_v, label, section = meta
         await state.set_state(AdminState.waiting_value)
         await state.update_data(admin_key=key)
-        hint = "HH:MM" if value_type == "time" else "число"
         await callback.answer()
-        await callback.message.answer(
-            f"✏️ <b>{html.escape(label)}</b>\n\n"
-            f"Сейчас: <code>{html.escape(str(get_setting(key)))}</code>\n"
-            f"Отправь новое значение ({hint})."
-        )
+        if value_type == "text":
+            current = html.escape(str(get_setting(key, "") or ""))
+            await callback.message.answer(
+                f"✏️ <b>{html.escape(label)}</b>\n\n"
+                f"<b>Сейчас:</b>\n<blockquote>{current}</blockquote>\n\n"
+                "Отправь новый текст правил одним сообщением. Можно использовать несколько строк."
+            )
+        else:
+            hint = "HH:MM" if value_type == "time" else "число"
+            await callback.message.answer(
+                f"✏️ <b>{html.escape(label)}</b>\n\n"
+                f"Сейчас: <code>{html.escape(str(get_setting(key)))}</code>\n"
+                f"Отправь новое значение ({hint})."
+            )
         return
 
     if action == "honey_toggle":
@@ -535,7 +588,13 @@ async def admin_callback_handler(callback: CallbackQuery, state: FSMContext):
             admin_name = html.escape(row.get("admin_name") or str(row["user_id"]))
             line = f"<b>{when}</b> · {admin_name}\n{html.escape(row['action'])}"
             if row.get("old_value") is not None or row.get("new_value") is not None:
-                line += f"\n<code>{html.escape(str(row.get('old_value')))}</code> → <code>{html.escape(str(row.get('new_value')))}</code>"
+                old_value = str(row.get("old_value"))
+                new_value = str(row.get("new_value"))
+                if len(old_value) > 120:
+                    old_value = old_value[:117] + "..."
+                if len(new_value) > 120:
+                    new_value = new_value[:117] + "..."
+                line += f"\n<code>{html.escape(old_value)}</code> → <code>{html.escape(new_value)}</code>"
             lines.append(line)
         await callback.answer()
         await _safe_edit(callback.message, "\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[_back()]))
