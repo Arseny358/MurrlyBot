@@ -102,7 +102,7 @@ def farm_keyboard():
                 f"💰 Цена {level}→{level+1}: {get_int(f'farm.upgrade.{level}')} 🍯",
                 f"admin:edit:farm.upgrade.{level}",
             )])
-    rows.append(_back()[0])
+    rows.append(_back())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -148,7 +148,7 @@ def gifts_keyboard():
     catalog = get_gift_catalog()
     for key, item in catalog.items():
         rows.append([_btn(f"{item['emoji']} {item['name']}", f"admin:gift:{key}")])
-    rows.append(_back()[0])
+    rows.append(_back())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
