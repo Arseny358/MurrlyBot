@@ -3,6 +3,7 @@ import os
 
 import uvicorn
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import main as bot_main
@@ -59,8 +60,7 @@ async def miniapp_group_middleware(handler, event, data):
             )
             return
 
-        # Main Mini App direct link. Telegram откроет приложение в контексте
-        # текущего группового чата и передаст chat_type/chat_instance.
+        # Main Mini App direct link.
         app_url = f"https://t.me/{me.username}?startapp=group"
 
         keyboard = InlineKeyboardMarkup(
@@ -86,9 +86,35 @@ async def miniapp_group_middleware(handler, event, data):
     return await handler(event, data)
 
 
-# Регистрируем перехват до запуска polling. Outer middleware срабатывает
-# до фильтров и обработчиков, поэтому /app не будет поглощён общим F.text.
+# Регистрируем перехват до запуска polling.
 bot_main.dp.message.outer_middleware(miniapp_group_middleware)
+
+
+@bot_main.bot.session.middleware()
+async def telegram_network_retry_middleware(make_request, current_bot, method):
+    """
+    Не даёт временному сетевому таймауту Telegram уронить весь MurrlyBot.
+
+    Aiogram оборачивает aiohttp/asyncio timeout в TelegramNetworkError.
+    При такой ошибке повторяем тот же запрос с увеличивающейся задержкой.
+    Это особенно важно на старте polling, когда Dispatcher вызывает getMe().
+    """
+    attempt = 0
+
+    while True:
+        try:
+            return await make_request(current_bot, method)
+        except TelegramNetworkError as exc:
+            attempt += 1
+            delay = min(30, 3 * attempt)
+
+            print(
+                "Telegram network error: "
+                f"method={method.__class__.__name__}, "
+                f"attempt={attempt}, retry_in={delay}s, error={exc}"
+            )
+
+            await asyncio.sleep(delay)
 
 
 async def run():
@@ -96,11 +122,12 @@ async def run():
     # для ручного запуска раздачи из защищённой админ-панели.
     set_bot_instance(bot_main.bot)
 
-    # Сначала запускаем обычный MurrlyBot.
+    # Запускаем обычный MurrlyBot.
+    # Временные сетевые таймауты Telegram теперь перехватываются
+    # telegram_network_retry_middleware и не завершают эту задачу.
     bot_task = asyncio.create_task(bot_main.main())
 
     # Инициализация таблиц в main.py занимает доли секунды.
-    # Небольшая задержка не даёт веб-интерфейсу принять запрос раньше БД.
     await asyncio.sleep(1.0)
 
     port = int(os.getenv("PORT", "8000"))
@@ -122,8 +149,8 @@ async def run():
         return_when=asyncio.FIRST_COMPLETED,
     )
 
-    # Если одна часть завершилась — корректно завершаем вторую,
-    # чтобы Bothost мог перезапустить весь контейнер целиком.
+    # Если одна из основных частей реально завершилась, корректно завершаем вторую,
+    # чтобы Bothost мог перезапустить весь контейнер.
     server.should_exit = True
     for task in pending:
         task.cancel()
