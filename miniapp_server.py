@@ -72,7 +72,16 @@ app = FastAPI(
 @app.middleware("http")
 async def miniapp_no_cache(request, call_next):
     response = await call_next(request)
-    if request.url.path in {"/", "/index.html", "/app.js", "/style.css"}:
+    if (
+        request.url.path in {
+            "/economy-v2",
+            "/economy-v2/",
+            "/index-economy-v2.html",
+            "/app-economy-v2.js",
+            "/style-economy-v2.css",
+        }
+        or request.url.path.startswith("/api/")
+    ):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -892,6 +901,19 @@ def api_admin_backup(user=Depends(require_admin)):
         path.name,
     )
     return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+@app.get("/economy-v2")
+@app.get("/economy-v2/")
+def economy_v2_index():
+    response = FileResponse(
+        STATIC_DIR / "index-economy-v2.html",
+        media_type="text/html",
+    )
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.get("/")
