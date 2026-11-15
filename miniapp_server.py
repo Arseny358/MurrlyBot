@@ -68,6 +68,16 @@ app = FastAPI(
     redoc_url=None,
 )
 
+
+@app.middleware("http")
+async def miniapp_no_cache(request, call_next):
+    response = await call_next(request)
+    if request.url.path in {"/", "/index.html", "/app.js", "/style.css"}:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 _bot_instance = None
 
 
