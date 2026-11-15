@@ -5,46 +5,14 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from database import connect
 from config import get_float, get_int
 
-
 BASE_GIFT_CATALOG = {
-    "rose": {
-        "emoji": "🌹",
-        "name": "Роза",
-        "price": 20,
-        "health_bonus": 0.1,
-    },
-    "chocolate": {
-        "emoji": "🍫",
-        "name": "Шоколадка",
-        "price": 35,
-        "health_bonus": 0.2,
-    },
-    "teddy": {
-        "emoji": "🧸",
-        "name": "Плюшевый мишка",
-        "price": 75,
-        "health_bonus": 0.3,
-    },
-    "bouquet": {
-        "emoji": "💐",
-        "name": "Букет цветов",
-        "price": 120,
-        "health_bonus": 0.5,
-    },
-    "crystal": {
-        "emoji": "💎",
-        "name": "Кристалл",
-        "price": 250,
-        "health_bonus": 0.7,
-    },
-    "crown": {
-        "emoji": "👑",
-        "name": "Золотая корона",
-        "price": 500,
-        "health_bonus": 1.0,
-    },
+    "rose": {"emoji": "🌹", "name": "Роза", "price": 20, "health_bonus": 0.1},
+    "chocolate": {"emoji": "🍫", "name": "Шоколадка", "price": 35, "health_bonus": 0.2},
+    "teddy": {"emoji": "🧸", "name": "Плюшевый мишка", "price": 75, "health_bonus": 0.3},
+    "bouquet": {"emoji": "💐", "name": "Букет цветов", "price": 120, "health_bonus": 0.5},
+    "crystal": {"emoji": "💎", "name": "Кристалл", "price": 250, "health_bonus": 0.7},
+    "crown": {"emoji": "👑", "name": "Золотая корона", "price": 500, "health_bonus": 1.0},
 }
-
 
 def init_gifts_db():
     with connect() as con:
@@ -55,7 +23,6 @@ def init_gifts_db():
             count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, gift_key)
         );
-
         CREATE TABLE IF NOT EXISTS gift_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             giver_id INTEGER NOT NULL,
@@ -64,7 +31,6 @@ def init_gifts_db():
             price INTEGER NOT NULL,
             created_at TEXT NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS gift_purchases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -72,13 +38,39 @@ def init_gifts_db():
             price INTEGER NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS gift_sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            gift_key TEXT NOT NULL,
+            original_price INTEGER NOT NULL,
+            sale_price INTEGER NOT NULL,
+            resale_pct REAL NOT NULL,
+            created_at TEXT NOT NULL
+        );
         """)
 
+def get_gift_catalog():
+    resale_pct = max(0.0, min(100.0, get_float("gift.resale_pct", 60)))
+    result = {}
+    for key, base in BASE_GIFT_CATALOG.items():
+        price = get_int(f"gift.{key}.price", int(base["price"]))
+        result[key] = {
+            **base,
+            "price": price,
+            "health_bonus": get_float(
+                f"gift.{key}.health_bonus", float(base["health_bonus"])
+            ),
+            "resale_price": max(0, int(price * resale_pct / 100.0)),
+            "resale_pct": resale_pct,
+        }
+    return result
+
+def get_gift(gift_key: str):
+    return get_gift_catalog().get(gift_key)
 
 def shop_keyboard(buyer_id: int):
     rows = []
     items = list(get_gift_catalog().items())
-
     for i in range(0, len(items), 2):
         row = []
         for key, gift in items[i:i + 2]:
@@ -87,29 +79,21 @@ def shop_keyboard(buyer_id: int):
                 callback_data=f"gift:buy:{key}:{buyer_id}",
             ))
         rows.append(row)
-
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def gift_inventory_keyboard(giver_id: int, recipient_id: int):
     collection = get_gift_collection(giver_id)
     rows = []
-
     for item in collection["items"]:
         rows.append([
             InlineKeyboardButton(
                 text=f"{item['emoji']} {item['name']} ×{item['count']}",
-                callback_data=(
-                    f"gift:send:{item['key']}:{recipient_id}:{giver_id}"
-                ),
+                callback_data=f"gift:send:{item['key']}:{recipient_id}:{giver_id}",
             )
         ])
-
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
-
 def purchase_gift(buyer_id: int, gift_key: str):
-    """Покупает подарок в личный инвентарь покупателя."""
     gift = get_gift(gift_key)
     if not gift:
         return {"status": "missing"}
@@ -117,14 +101,11 @@ def purchase_gift(buyer_id: int, gift_key: str):
     con = connect()
     try:
         con.execute("BEGIN IMMEDIATE")
-
         wallet = con.execute(
-            "SELECT balance FROM honey_wallets WHERE user_id=?",
-            (buyer_id,),
+            "SELECT balance FROM honey_wallets WHERE user_id=?", (buyer_id,)
         ).fetchone()
         balance = int(wallet["balance"]) if wallet else 0
         price = int(gift["price"])
-
         if balance < price:
             con.rollback()
             return {
@@ -134,35 +115,22 @@ def purchase_gift(buyer_id: int, gift_key: str):
                 "gift": gift,
             }
 
-        con.execute(
-            "UPDATE honey_wallets SET balance=balance-? WHERE user_id=?",
-            (price, buyer_id),
-        )
-
+        con.execute("UPDATE honey_wallets SET balance=balance-? WHERE user_id=?", (price, buyer_id))
         con.execute("""
             INSERT INTO gift_inventory(user_id, gift_key, count)
             VALUES (?, ?, 1)
-            ON CONFLICT(user_id, gift_key) DO UPDATE SET
-                count = count + 1
+            ON CONFLICT(user_id, gift_key) DO UPDATE SET count=count+1
         """, (buyer_id, gift_key))
-
         con.execute("""
             INSERT INTO gift_purchases(user_id, gift_key, price, created_at)
             VALUES (?, ?, ?, ?)
-        """, (
-            buyer_id,
-            gift_key,
-            price,
-            datetime.utcnow().isoformat(timespec="seconds"),
-        ))
-
-        row = con.execute("""
-            SELECT count FROM gift_inventory
-            WHERE user_id=? AND gift_key=?
-        """, (buyer_id, gift_key)).fetchone()
-
+        """, (buyer_id, gift_key, price, datetime.utcnow().isoformat(timespec="seconds")))
+        row = con.execute(
+            "SELECT count FROM gift_inventory WHERE user_id=? AND gift_key=?",
+            (buyer_id, gift_key),
+        ).fetchone()
         con.commit()
-        return {
+        result = {
             "status": "ok",
             "gift": gift,
             "balance": balance - price,
@@ -174,69 +142,124 @@ def purchase_gift(buyer_id: int, gift_key: str):
     finally:
         con.close()
 
+    try:
+        from daily_tasks import record_task_progress
+        record_task_progress(buyer_id, "gift", 1)
+    except Exception:
+        pass
+    return result
 
-def transfer_gift(giver_id: int, recipient_id: int, gift_key: str):
-    """Передаёт один уже купленный подарок из инвентаря другому пользователю."""
+def sell_gift(user_id: int, gift_key: str, count: int = 1):
     gift = get_gift(gift_key)
     if not gift:
         return {"status": "missing"}
+    count = max(1, int(count))
 
+    con = connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT count FROM gift_inventory WHERE user_id=? AND gift_key=?",
+            (int(user_id), gift_key),
+        ).fetchone()
+        owned = int(row["count"]) if row else 0
+        if owned < count:
+            con.rollback()
+            return {"status": "not_owned", "owned": owned}
+
+        sale_each = int(gift["resale_price"])
+        total = sale_each * count
+        new_count = owned - count
+        if new_count <= 0:
+            con.execute(
+                "DELETE FROM gift_inventory WHERE user_id=? AND gift_key=?",
+                (int(user_id), gift_key),
+            )
+        else:
+            con.execute(
+                "UPDATE gift_inventory SET count=? WHERE user_id=? AND gift_key=?",
+                (new_count, int(user_id), gift_key),
+            )
+
+        con.execute("""
+            INSERT INTO honey_wallets(user_id, balance, total_earned, giveaways_claimed, biggest_claim)
+            VALUES (?, ?, 0, 0, 0)
+            ON CONFLICT(user_id) DO UPDATE SET balance=balance+excluded.balance
+        """, (int(user_id), total))
+
+        con.execute("""
+            INSERT INTO gift_sales(
+                user_id, gift_key, original_price, sale_price, resale_pct, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            int(user_id), gift_key, int(gift["price"]), total,
+            float(gift["resale_pct"]), datetime.utcnow().isoformat(timespec="seconds"),
+        ))
+        wallet = con.execute(
+            "SELECT balance FROM honey_wallets WHERE user_id=?", (int(user_id),)
+        ).fetchone()
+        con.commit()
+        return {
+            "status": "ok",
+            "gift": gift,
+            "count": count,
+            "received": total,
+            "owned": new_count,
+            "balance": int(wallet["balance"]),
+        }
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+def transfer_gift(giver_id: int, recipient_id: int, gift_key: str):
+    gift = get_gift(gift_key)
+    if not gift:
+        return {"status": "missing"}
     if giver_id == recipient_id:
         return {"status": "self"}
 
     con = connect()
     try:
         con.execute("BEGIN IMMEDIATE")
-
-        owned = con.execute("""
-            SELECT count FROM gift_inventory
-            WHERE user_id=? AND gift_key=?
-        """, (giver_id, gift_key)).fetchone()
-
+        owned = con.execute(
+            "SELECT count FROM gift_inventory WHERE user_id=? AND gift_key=?",
+            (giver_id, gift_key),
+        ).fetchone()
         owned_count = int(owned["count"]) if owned else 0
         if owned_count <= 0:
             con.rollback()
             return {"status": "not_owned", "gift": gift}
 
-        # Убираем один подарок у дарителя.
         new_giver_count = owned_count - 1
         if new_giver_count <= 0:
-            con.execute("""
-                DELETE FROM gift_inventory
-                WHERE user_id=? AND gift_key=?
-            """, (giver_id, gift_key))
+            con.execute(
+                "DELETE FROM gift_inventory WHERE user_id=? AND gift_key=?",
+                (giver_id, gift_key),
+            )
         else:
-            con.execute("""
-                UPDATE gift_inventory SET count=?
-                WHERE user_id=? AND gift_key=?
-            """, (new_giver_count, giver_id, gift_key))
+            con.execute(
+                "UPDATE gift_inventory SET count=? WHERE user_id=? AND gift_key=?",
+                (new_giver_count, giver_id, gift_key),
+            )
 
-        # Добавляем его получателю.
         con.execute("""
             INSERT INTO gift_inventory(user_id, gift_key, count)
             VALUES (?, ?, 1)
-            ON CONFLICT(user_id, gift_key) DO UPDATE SET
-                count = count + 1
+            ON CONFLICT(user_id, gift_key) DO UPDATE SET count=count+1
         """, (recipient_id, gift_key))
-
         con.execute("""
-            INSERT INTO gift_history(
-                giver_id, recipient_id, gift_key, price, created_at
-            )
+            INSERT INTO gift_history(giver_id, recipient_id, gift_key, price, created_at)
             VALUES (?, ?, ?, ?, ?)
         """, (
-            giver_id,
-            recipient_id,
-            gift_key,
-            int(gift["price"]),
+            giver_id, recipient_id, gift_key, int(gift["price"]),
             datetime.utcnow().isoformat(timespec="seconds"),
         ))
-
-        recipient_row = con.execute("""
-            SELECT count FROM gift_inventory
-            WHERE user_id=? AND gift_key=?
-        """, (recipient_id, gift_key)).fetchone()
-
+        recipient_row = con.execute(
+            "SELECT count FROM gift_inventory WHERE user_id=? AND gift_key=?",
+            (recipient_id, gift_key),
+        ).fetchone()
         con.commit()
         return {
             "status": "ok",
@@ -250,8 +273,8 @@ def transfer_gift(giver_id: int, recipient_id: int, gift_key: str):
     finally:
         con.close()
 
-
 def get_gift_collection(user_id: int):
+    init_gifts_db()
     with connect() as con:
         rows = con.execute("""
             SELECT gift_key, count
@@ -259,11 +282,9 @@ def get_gift_collection(user_id: int):
             WHERE user_id=? AND count>0
             ORDER BY count DESC, gift_key
         """, (user_id,)).fetchall()
-
         total = con.execute("""
             SELECT COALESCE(SUM(count), 0) AS total
-            FROM gift_inventory
-            WHERE user_id=?
+            FROM gift_inventory WHERE user_id=?
         """, (user_id,)).fetchone()
 
     items = []
@@ -271,33 +292,8 @@ def get_gift_collection(user_id: int):
         gift = get_gift(row["gift_key"])
         if not gift:
             continue
-        items.append({
-            "key": row["gift_key"],
-            "count": int(row["count"]),
-            **gift,
-        })
+        items.append({"key": row["gift_key"], "count": int(row["count"]), **gift})
 
-    return {
-        "items": items,
-        "total": int(total["total"]),
-    }
+    return {"items": items, "total": int(total["total"])}
 
-
-def get_gift_catalog():
-    result = {}
-    for key, base in BASE_GIFT_CATALOG.items():
-        result[key] = {
-            **base,
-            "price": get_int(f"gift.{key}.price", int(base["price"])),
-            "health_bonus": get_float(
-                f"gift.{key}.health_bonus", float(base["health_bonus"])
-            ),
-        }
-    return result
-
-
-def get_gift(gift_key: str):
-    return get_gift_catalog().get(gift_key)
-
-# Совместимость со старым импортом из main.py.
 GIFT_CATALOG = BASE_GIFT_CATALOG
